@@ -407,6 +407,7 @@ public:
   bool isVMEMOrFlatVMEM(const MachineInstr &MI) const;
   bool isDSRead(const MachineInstr &MI) const;
   bool mayStoreIncrementingDSCNT(const MachineInstr &MI) const;
+  bool fixGFX90ADirectLDSReadHazards();
   bool run();
 
   bool isAsync(const MachineInstr &MI) const {
@@ -3475,6 +3476,220 @@ SIInsertWaitcntsPass::run(MachineFunction &MF,
       .preserve<AAManager>();
 }
 
+bool SIInsertWaitcnts::fixGFX90ADirectLDSReadHazards() {
+  if (!ST.hasGFX90AInsts() || ST.hasGFX940Insts())
+    return false;
+
+  using DirectLoadSet = SmallVector<const MachineInstr *, 4>;
+  auto IsDirectLDSLoad = [&](const MachineInstr &MI) {
+    return TII.isFLATGlobal(MI) && isNonAsyncLdsDmaWrite(MI);
+  };
+  auto IsDSRead = [&](const MachineInstr &MI) {
+    return TII.isDS(MI) && MI.mayLoad();
+  };
+  auto AddUnique = [](DirectLoadSet &Set, const MachineInstr *MI) {
+    if (!is_contained(Set, MI))
+      Set.push_back(MI);
+  };
+  auto RemoveAll = [](DirectLoadSet &Set, const DirectLoadSet &Removed) {
+    for (const MachineInstr *MI : Removed) {
+      auto I = llvm::find(Set, MI);
+      if (I != Set.end())
+        Set.erase(I);
+    }
+  };
+  auto SameSet = [](const DirectLoadSet &A, const DirectLoadSet &B) {
+    if (A.size() != B.size())
+      return false;
+    for (const MachineInstr *MI : A)
+      if (!is_contained(B, MI))
+        return false;
+    return true;
+  };
+  auto MayAliasDirectLDS = [&](MachineInstr &Read,
+                               const MachineInstr &Load) {
+    for (const MachineMemOperand *ReadMem : Read.memoperands()) {
+      if (!ReadMem->isLoad() ||
+          ReadMem->getAddrSpace() != AMDGPUAS::LOCAL_ADDRESS)
+        continue;
+      for (const MachineMemOperand *LoadMem : Load.memoperands()) {
+        if (!LoadMem->isStore() ||
+            LoadMem->getAddrSpace() != AMDGPUAS::LOCAL_ADDRESS)
+          continue;
+        if (ReadMem->getValue() &&
+            ReadMem->getValue() == LoadMem->getValue())
+          return true;
+      }
+    }
+    return Read.mayAlias(AA, Load, true);
+  };
+  auto GetAliasingLoads = [&](MachineInstr &Read,
+                              const DirectLoadSet &Active) {
+    DirectLoadSet Aliasing;
+    for (const MachineInstr *Load : Active)
+      if (MayAliasDirectLDS(Read, *Load))
+        Aliasing.push_back(Load);
+    return Aliasing;
+  };
+  auto Transfer = [&](MachineBasicBlock &MBB, DirectLoadSet Active) {
+    DirectLoadSet Pending;
+    for (MachineInstr &MI : MBB) {
+      if (MI.isMetaInstruction())
+        continue;
+
+      const bool DSOp = TII.isDS(MI);
+      if (DSOp && !Pending.empty()) {
+        RemoveAll(Active, Pending);
+        Pending.clear();
+      }
+
+      if (IsDirectLDSLoad(MI))
+        AddUnique(Active, &MI);
+      else if (IsDSRead(MI))
+        Pending = GetAliasingLoads(MI, Active);
+    }
+
+    // The insertion pass closes a pending read at block end with a proven
+    // reread sequence.
+    RemoveAll(Active, Pending);
+    return Active;
+  };
+
+  // Keep each direct load active until an aliasing DS read is followed by one
+  // more DS operation. An unrelated DS read before the aliasing read does not
+  // satisfy the gfx90a hardware rule.
+  DenseMap<MachineBasicBlock *, DirectLoadSet> Incoming;
+  DenseMap<MachineBasicBlock *, DirectLoadSet> Outgoing;
+  bool Changed;
+  do {
+    Changed = false;
+    for (MachineBasicBlock &MBB : MF) {
+      DirectLoadSet In;
+      for (MachineBasicBlock *Pred : MBB.predecessors())
+        for (const MachineInstr *Load : Outgoing[Pred])
+          AddUnique(In, Load);
+      if (!SameSet(Incoming[&MBB], In)) {
+        Incoming[&MBB] = In;
+        Changed = true;
+      }
+
+      DirectLoadSet Out = Transfer(MBB, In);
+      if (!SameSet(Outgoing[&MBB], Out)) {
+        Outgoing[&MBB] = std::move(Out);
+        Changed = true;
+      }
+    }
+  } while (Changed);
+
+  MCRegister HazardScratchVGPR;
+  auto GetHazardScratchVGPR = [&]() {
+    if (!HazardScratchVGPR)
+      HazardScratchVGPR = TRI.findUnusedRegister(
+          MF.getRegInfo(), &AMDGPU::VGPR_32RegClass, MF);
+    if (!HazardScratchVGPR)
+      report_fatal_error(
+          "gfx90a direct-LDS read hazard requires one unused VGPR");
+    return HazardScratchVGPR;
+  };
+  auto InsertDummyRead = [&](MachineBasicBlock &MBB,
+                             MachineBasicBlock::iterator InsertBefore,
+                             MachineInstr *PendingRead, const DebugLoc &DL) {
+    if (PendingRead->getOpcode() != AMDGPU::DS_READ_B32_gfx9) {
+      if (PendingRead->getOpcode() != AMDGPU::DS_READ2_B32_gfx9)
+        report_fatal_error("automatic gfx90a direct-LDS hazard repair is "
+                           "currently supported only for ds_read_b32 and "
+                           "ds_read2_b32");
+      MachineInstr *Duplicate = MF.CloneMachineInstr(PendingRead);
+      Duplicate->setDebugLoc(DL);
+      MBB.insert(InsertBefore, Duplicate);
+      return;
+    }
+
+    const MachineOperand *Addr =
+        TII.getNamedOperand(*PendingRead, AMDGPU::OpName::addr);
+    assert(Addr && Addr->isReg());
+    MCRegister Dst;
+    for (const MachineOperand &Def : PendingRead->defs())
+      if (Def.isReg() && Def.getReg()) {
+        Dst = Def.getReg().asMCReg();
+        break;
+      }
+    assert(Dst);
+
+    MCRegister Scratch = GetHazardScratchVGPR();
+    BuildMI(MBB, PendingRead->getIterator(), PendingRead->getDebugLoc(),
+            TII.get(AMDGPU::V_MOV_B32_e32), Scratch)
+        .addReg(Addr->getReg());
+    BuildMI(MBB, InsertBefore, DL, TII.get(AMDGPU::DS_READ_B32_gfx9), Scratch)
+        .addReg(Scratch)
+        .addImm(0)
+        .addImm(0);
+    BuildMI(MBB, InsertBefore, DL, TII.get(AMDGPU::V_MOV_B32_e32), Dst)
+        .addReg(Scratch);
+  };
+
+  bool Modified = false;
+  for (MachineBasicBlock &MBB : MF) {
+    DirectLoadSet Active = Incoming[&MBB];
+    DirectLoadSet PendingLoads;
+    MachineInstr *PendingRead = nullptr;
+    SmallVector<Register, 4> PendingDefs;
+
+    for (MachineInstr &MI : make_early_inc_range(MBB)) {
+      if (MI.isMetaInstruction())
+        continue;
+
+      const bool DirectLDSLoad = IsDirectLDSLoad(MI);
+      const bool DSOp = TII.isDS(MI);
+      const bool DSRead = IsDSRead(MI);
+
+      if (!PendingLoads.empty()) {
+        bool ConsumesPending = false;
+        for (Register Reg : PendingDefs)
+          if (MI.readsRegister(Reg, &TRI)) {
+            ConsumesPending = true;
+            break;
+          }
+        bool MustClose = DirectLDSLoad || MI.isTerminator() || ConsumesPending;
+
+        if (DSOp || MustClose) {
+          if (!DSOp || ConsumesPending) {
+            InsertDummyRead(MBB, MI.getIterator(), PendingRead,
+                            MI.getDebugLoc());
+            Modified = true;
+          }
+          RemoveAll(Active, PendingLoads);
+          PendingLoads.clear();
+          PendingRead = nullptr;
+          PendingDefs.clear();
+        }
+      }
+
+      if (DirectLDSLoad) {
+        AddUnique(Active, &MI);
+        continue;
+      }
+
+      if (DSRead) {
+        PendingLoads = GetAliasingLoads(MI, Active);
+        if (!PendingLoads.empty()) {
+          PendingRead = &MI;
+          for (const MachineOperand &Def : MI.defs())
+            if (Def.isReg() && Def.getReg())
+              PendingDefs.push_back(Def.getReg());
+        }
+      }
+    }
+
+    if (!PendingLoads.empty()) {
+      InsertDummyRead(MBB, MBB.end(), PendingRead, DebugLoc());
+      Modified = true;
+    }
+  }
+
+  return Modified;
+}
+
 bool SIInsertWaitcnts::run() {
   const SIMachineFunctionInfo *MFI = MF.getInfo<SIMachineFunctionInfo>();
 
@@ -3504,7 +3719,7 @@ bool SIInsertWaitcnts::run() {
 
   SmemAccessCounter = getCounterFromEvent(HWEvents::SMEM_ACCESS);
 
-  bool Modified = false;
+  bool Modified = fixGFX90ADirectLDSReadHazards();
 
   MachineBasicBlock &EntryBB = MF.front();
 

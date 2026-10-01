@@ -46,6 +46,10 @@ bool SemaAMDGPU::CheckAMDGCNBuiltinFunctionCall(const TargetInfo &TI,
   getASTContext().getFunctionFeatureMap(CallerFeatureMap, FD);
   bool HasGFX950Insts =
       Builtin::evaluateRequiredTargetFeatures("gfx950-insts", CallerFeatureMap);
+  bool HasGFX90AInsts =
+      Builtin::evaluateRequiredTargetFeatures("gfx90a-insts", CallerFeatureMap);
+  bool HasGFX940Insts =
+      Builtin::evaluateRequiredTargetFeatures("gfx940-insts", CallerFeatureMap);
 
   switch (BuiltinID) {
   case AMDGPU::BI__builtin_amdgcn_raw_ptr_buffer_load_lds:
@@ -66,14 +70,26 @@ bool SemaAMDGPU::CheckAMDGCNBuiltinFunctionCall(const TargetInfo &TI,
     [[maybe_unused]] ExprResult R =
         SemaRef.VerifyIntegerConstantExpression(ArgExpr, &Size);
     assert(!R.isInvalid());
+    const bool IsGlobalLoad =
+        BuiltinID == AMDGPU::BI__builtin_amdgcn_load_to_lds ||
+        BuiltinID == AMDGPU::BI__builtin_amdgcn_load_async_to_lds ||
+        BuiltinID == AMDGPU::BI__builtin_amdgcn_global_load_lds ||
+        BuiltinID == AMDGPU::BI__builtin_amdgcn_global_load_async_lds;
+    const bool HasGFX90ADirectLDS =
+        IsGlobalLoad && HasGFX90AInsts && !HasGFX940Insts;
     switch (Size.getSExtValue()) {
     case 1:
     case 2:
     case 4:
       return false;
+    case 8:
+      if (HasGFX90ADirectLDS)
+        return false;
+      [[fallthrough]];
     case 12:
     case 16: {
-      if (HasGFX950Insts)
+      if ((Size.getSExtValue() != 8 && HasGFX950Insts) ||
+          HasGFX90ADirectLDS)
         return false;
       [[fallthrough]];
     }
@@ -81,9 +97,10 @@ bool SemaAMDGPU::CheckAMDGCNBuiltinFunctionCall(const TargetInfo &TI,
       SemaRef.targetDiag(ArgExpr->getExprLoc(),
                          diag::err_amdgcn_load_lds_size_invalid_value)
           << ArgExpr->getSourceRange();
+      unsigned ValidSizes = HasGFX90ADirectLDS ? 2 : HasGFX950Insts;
       SemaRef.targetDiag(ArgExpr->getExprLoc(),
                          diag::note_amdgcn_load_lds_size_valid_value)
-          << HasGFX950Insts << ArgExpr->getSourceRange();
+          << ValidSizes << ArgExpr->getSourceRange();
       return true;
     }
   }

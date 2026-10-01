@@ -1220,7 +1220,13 @@ defm GLOBAL_LOAD_LDS_USHORT : FLAT_Global_Load_LDS_Pseudo <"global_load_lds_usho
 defm GLOBAL_LOAD_LDS_SSHORT : FLAT_Global_Load_LDS_Pseudo <"global_load_lds_sshort", 0, 1>;
 defm GLOBAL_LOAD_LDS_DWORD  : FLAT_Global_Load_LDS_Pseudo <"global_load_lds_dword", 0, 1>;
 
-let SubtargetPredicate = HasGFX950Insts in {
+// These pre-gfx940 encodings execute on gfx90a although the published MI200
+// ISA and the upstream assembler do not expose them. gfx950 uses different,
+// dedicated x3 and x4 opcodes. There is no corresponding gfx950 x2 opcode.
+let SubtargetPredicate = isGFX90AOnly in
+  defm GLOBAL_LOAD_LDS_DWORDX2 : FLAT_Global_Load_LDS_Pseudo <"global_load_lds_dwordx2", 0, 1>;
+
+let SubtargetPredicate = isGFX90AOnlyOrGFX950 in {
 defm GLOBAL_LOAD_LDS_DWORDX3 : FLAT_Global_Load_LDS_Pseudo <"global_load_lds_dwordx3", 0, 1>;
 defm GLOBAL_LOAD_LDS_DWORDX4 : FLAT_Global_Load_LDS_Pseudo <"global_load_lds_dwordx4", 0, 1>;
 }
@@ -2884,8 +2890,12 @@ defm GLOBAL_LOAD_LDS_USHORT : FLAT_Real_AllAddr_LDS <0x028, 0x12>;
 defm GLOBAL_LOAD_LDS_SSHORT : FLAT_Real_AllAddr_LDS <0x029, 0x13>;
 defm GLOBAL_LOAD_LDS_DWORD  : FLAT_Real_AllAddr_LDS <0x02a, 0x14>;
 
-defm GLOBAL_LOAD_LDS_DWORDX3 : FLAT_Real_AllAddr_LDS <0x07e, 0x07e>;
-defm GLOBAL_LOAD_LDS_DWORDX4 : FLAT_Real_AllAddr_LDS <0x07d, 0x07d>;
+// gfx90a uses the normal GLOBAL_LOAD width opcodes with LDS=1. The first
+// opcode is unused for x2 because its pseudo is gfx90a-only. gfx950 uses the
+// dedicated 0x7e and 0x7d opcodes for x3 and x4.
+defm GLOBAL_LOAD_LDS_DWORDX2 : FLAT_Real_AllAddr_LDS <0x07f, 0x15>;
+defm GLOBAL_LOAD_LDS_DWORDX3 : FLAT_Real_AllAddr_LDS <0x07e, 0x16>;
+defm GLOBAL_LOAD_LDS_DWORDX4 : FLAT_Real_AllAddr_LDS <0x07d, 0x17>;
 
 
 defm GLOBAL_ATOMIC_SWAP       : FLAT_Global_Real_Atomics_vi <0x40>;

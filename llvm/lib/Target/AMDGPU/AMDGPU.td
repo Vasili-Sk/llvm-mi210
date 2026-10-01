@@ -2987,6 +2987,15 @@ def isGFX90AOnly :
   Predicate<"Subtarget->hasGFX90AInsts() && !Subtarget->hasGFX940Insts()">,
   AssemblerPredicate<(all_of FeatureGFX90AInsts, (not FeatureGFX940Insts))>;
 
+// gfx90a executes the pre-gfx940 wide global-to-LDS encodings. gfx950 uses
+// the newer dedicated opcodes for the x3 and x4 forms.
+def isGFX90AOnlyOrGFX950 :
+  Predicate<"(Subtarget->hasGFX90AInsts() && !Subtarget->hasGFX940Insts()) || "
+            "Subtarget->hasGFX950Insts()">,
+  AssemblerPredicate<(any_of
+    (all_of FeatureGFX90AInsts, (not FeatureGFX940Insts)),
+    FeatureGFX950Insts)>;
+
 def isGFX908orGFX90A :
   Predicate<"Subtarget->hasMAIInsts() && !Subtarget->hasGFX940Insts()">,
   AssemblerPredicate<(all_of FeatureMAIInsts, (not FeatureGFX940Insts))>;

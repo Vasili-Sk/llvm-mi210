@@ -13036,13 +13036,20 @@ SDValue SITargetLowering::LowerINTRINSIC_VOID(SDValue Op,
     case 4:
       Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORD;
       break;
+    case 8:
+      if (!Subtarget->hasGFX90AInsts() || Subtarget->hasGFX940Insts())
+        return SDValue();
+      Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX2;
+      break;
     case 12:
-      if (!Subtarget->hasLDSLoadB96_B128())
+      if (!Subtarget->hasLDSLoadB96_B128() &&
+          (!Subtarget->hasGFX90AInsts() || Subtarget->hasGFX940Insts()))
         return SDValue();
       Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX3;
       break;
     case 16:
-      if (!Subtarget->hasLDSLoadB96_B128())
+      if (!Subtarget->hasLDSLoadB96_B128() &&
+          (!Subtarget->hasGFX90AInsts() || Subtarget->hasGFX940Insts()))
         return SDValue();
       Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX4;
       break;

@@ -3766,13 +3766,20 @@ bool AMDGPUInstructionSelector::selectGlobalLoadLds(MachineInstr &MI) const{
   case 4:
     Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORD;
     break;
+  case 8:
+    if (!Subtarget->hasGFX90AInsts() || Subtarget->hasGFX940Insts())
+      return false;
+    Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX2;
+    break;
   case 12:
-    if (!Subtarget->hasLDSLoadB96_B128())
+    if (!Subtarget->hasLDSLoadB96_B128() &&
+        (!Subtarget->hasGFX90AInsts() || Subtarget->hasGFX940Insts()))
       return false;
     Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX3;
     break;
   case 16:
-    if (!Subtarget->hasLDSLoadB96_B128())
+    if (!Subtarget->hasLDSLoadB96_B128() &&
+        (!Subtarget->hasGFX90AInsts() || Subtarget->hasGFX940Insts()))
       return false;
     Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX4;
     break;
@@ -3825,21 +3832,35 @@ bool AMDGPUInstructionSelector::selectGlobalLoadLds(MachineInstr &MI) const{
   MIB.addImm(Aux & ~AMDGPU::CPol::VIRTUAL_BITS); // cpol
   MIB.addImm(isAsyncLDSDMA(IntrinsicID));
 
-  MachineMemOperand *LoadMMO = *MI.memoperands_begin();
+  MachineMemOperand *LoadMMO = nullptr;
+  MachineMemOperand *StoreMMO = nullptr;
+  for (MachineMemOperand *MMO : MI.memoperands()) {
+    if (MMO->isLoad() && !LoadMMO)
+      LoadMMO = MMO;
+    if (MMO->isStore() &&
+        MMO->getAddrSpace() == AMDGPUAS::LOCAL_ADDRESS && !StoreMMO)
+      StoreMMO = MMO;
+  }
+  assert(LoadMMO && StoreMMO);
+
   MachinePointerInfo LoadPtrI = LoadMMO->getPointerInfo();
   LoadPtrI.Offset = MI.getOperand(4).getImm();
-  MachinePointerInfo StorePtrI = LoadPtrI;
   LoadPtrI.V = PoisonValue::get(PointerType::get(MF->getFunction().getContext(),
                                                  AMDGPUAS::GLOBAL_ADDRESS));
   LoadPtrI.AddrSpace = AMDGPUAS::GLOBAL_ADDRESS;
-  StorePtrI.AddrSpace = AMDGPUAS::LOCAL_ADDRESS;
-  auto F = LoadMMO->getFlags() &
-           ~(MachineMemOperand::MOStore | MachineMemOperand::MOLoad);
-  LoadMMO = MF->getMachineMemOperand(LoadPtrI, F | MachineMemOperand::MOLoad,
-                                     Size, LoadMMO->getBaseAlign());
-  MachineMemOperand *StoreMMO =
-      MF->getMachineMemOperand(StorePtrI, F | MachineMemOperand::MOStore,
-                               sizeof(int32_t), Align(4));
+  auto LoadFlags = LoadMMO->getFlags() &
+                   ~(MachineMemOperand::MOStore | MachineMemOperand::MOLoad);
+  LoadMMO = MF->getMachineMemOperand(
+      LoadPtrI, LoadFlags | MachineMemOperand::MOLoad, Size,
+      LoadMMO->getBaseAlign());
+
+  MachinePointerInfo StorePtrI = StoreMMO->getPointerInfo();
+  StorePtrI.Offset = MI.getOperand(4).getImm();
+  auto StoreFlags = StoreMMO->getFlags() &
+                    ~(MachineMemOperand::MOStore | MachineMemOperand::MOLoad);
+  StoreMMO = MF->getMachineMemOperand(
+      StorePtrI, StoreFlags | MachineMemOperand::MOStore, StoreMMO->getSize(),
+      StoreMMO->getBaseAlign());
 
   MIB.setMemRefs({LoadMMO, StoreMMO});
 

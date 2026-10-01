@@ -311,9 +311,17 @@ void llvm::verifyAMDGPUIntrinsicCall(VerifierSupport &VS, Intrinsic::ID ID,
   case Intrinsic::amdgcn_struct_ptr_buffer_load_lds:
   case Intrinsic::amdgcn_struct_ptr_buffer_load_async_lds: {
     uint64_t Size = cast<ConstantInt>(Call.getArgOperand(2))->getZExtValue();
-    Check(Size == 1 || Size == 2 || Size == 4 || Size == 12 || Size == 16,
-          "invalid data size for load-to-LDS intrinsic; must be 1, 2, 4, 12, "
-          "or 16",
+    bool IsGlobalLoad = ID == Intrinsic::amdgcn_load_to_lds ||
+                        ID == Intrinsic::amdgcn_load_async_to_lds ||
+                        ID == Intrinsic::amdgcn_global_load_lds ||
+                        ID == Intrinsic::amdgcn_global_load_async_lds;
+    Check(Size == 1 || Size == 2 || Size == 4 ||
+              (IsGlobalLoad && Size == 8) || Size == 12 || Size == 16,
+          IsGlobalLoad
+              ? "invalid data size for load-to-LDS intrinsic; must be 1, 2, "
+                "4, 8, 12, or 16"
+              : "invalid data size for load-to-LDS intrinsic; must be 1, 2, "
+                "4, 12, or 16",
           &Call);
     break;
   }

@@ -1388,6 +1388,26 @@ class AMDGPUAsmParser : public MCTargetAsmParser {
       OpcodeStreamSymbols;
   SmallPtrSet<const MCSymbol *, 8> AMDHSAKernelSymbols;
 
+  // A marked gfx90a read from a freshly direct-written LDS slot must be
+  // followed by one more DS read before its result is consumed.
+  enum class GFX90ADirectLDSHazardPolicy {
+    Automatic,
+    Manual,
+    ManualNoWarn,
+  };
+  GFX90ADirectLDSHazardPolicy GFX90AHazardPolicy =
+      GFX90ADirectLDSHazardPolicy::Automatic;
+  bool GFX90AMarkNextDSRead = false;
+  bool GFX90AHasPendingDSRead = false;
+  MCInst GFX90APendingDSRead;
+  SMLoc GFX90APendingDSReadLoc;
+  MCRegister GFX90ADummyVGPR;
+  MCRegister GFX90APendingDSReadAddr;
+  SmallVector<MCRegister, 4> GFX90APendingDSReadDefs;
+
+  void resolveGFX90ADirectLDSHazard(MCStreamer &Out, SMLoc Loc,
+                                    StringRef Reason);
+
   /// Verify recorded kernel prologues.
   void checkKernelPrologues();
 
@@ -1432,6 +1452,8 @@ private:
   bool ParseDirectivePALMetadata();
   bool ParseDirectiveAMDGPULDS();
   bool ParseDirectiveAMDGPUInfo();
+  bool ParseDirectiveGFX90ADirectLDSHazard();
+  bool ParseDirectiveGFX90ADirectLDSRead();
 
   /// Common code to parse out a block of text (typically YAML) between start
   /// and end directives.
@@ -6004,6 +6026,110 @@ bool AMDGPUAsmParser::matchAndEmitInstruction(SMLoc IDLoc, unsigned &Opcode,
       return true;
     }
     emitTargetDirective();
+
+    if (isGFX90A() && !isGFX940()) {
+      const MCInstrDesc &Desc = MII.get(Inst.getOpcode());
+      const bool IsDS = SIInstrFlags::isDS(Desc);
+      const bool IsDSRead = IsDS && Desc.mayLoad();
+      const bool IsDirectLDSLoad =
+          MII.getName(Inst.getOpcode()).starts_with("GLOBAL_LOAD_LDS_");
+
+      if (GFX90AMarkNextDSRead && !IsDSRead)
+        return Error(IDLoc, ".amdgpu_gfx90a_direct_lds_read must be followed "
+                            "by a DS read instruction");
+
+      if (GFX90AHasPendingDSRead) {
+        bool ConsumesPending = false;
+        bool OverwritesPending = false;
+        bool OverwritesPendingAddr = false;
+        for (unsigned I = 0, E = Inst.getNumOperands(); I != E; ++I) {
+          if (!Inst.getOperand(I).isReg())
+            continue;
+          for (MCRegister Def : GFX90APendingDSReadDefs) {
+            if (!getMRI()->regsOverlap(Def, Inst.getOperand(I).getReg()))
+              continue;
+            if (I < Desc.getNumDefs())
+              OverwritesPending = true;
+            else
+              ConsumesPending = true;
+          }
+          if (I < Desc.getNumDefs() && GFX90APendingDSReadAddr &&
+              getMRI()->regsOverlap(GFX90APendingDSReadAddr,
+                                    Inst.getOperand(I).getReg())) {
+            OverwritesPendingAddr = true;
+          }
+        }
+
+        bool ChangesExec =
+            Desc.hasImplicitDefOfPhysReg(AMDGPU::EXEC) ||
+            Desc.hasImplicitDefOfPhysReg(AMDGPU::EXEC_LO);
+        for (unsigned I = 0,
+                      E = std::min<unsigned>(Desc.getNumDefs(),
+                                             Inst.getNumOperands());
+             I != E && !ChangesExec; ++I)
+          if (Inst.getOperand(I).isReg() &&
+              (getMRI()->regsOverlap(AMDGPU::EXEC,
+                                     Inst.getOperand(I).getReg()) ||
+               getMRI()->regsOverlap(AMDGPU::EXEC_LO,
+                                     Inst.getOperand(I).getReg())))
+            ChangesExec = true;
+
+        if (IsDS && !ConsumesPending) {
+          GFX90AHasPendingDSRead = false;
+          GFX90APendingDSReadAddr = MCRegister();
+          GFX90APendingDSReadDefs.clear();
+        } else if (ConsumesPending || OverwritesPendingAddr ||
+                   IsDirectLDSLoad || Desc.isBranch() || ChangesExec) {
+          resolveGFX90ADirectLDSHazard(
+              Out, IDLoc,
+              ConsumesPending ? "its result is consumed"
+              : OverwritesPendingAddr ? "its LDS address register is overwritten"
+              : IsDirectLDSLoad ? "another direct-LDS load is issued"
+              : Desc.isBranch() ? "control flow changes"
+                                : "the exec mask changes");
+        } else if (OverwritesPending) {
+          GFX90AHasPendingDSRead = false;
+          GFX90APendingDSReadAddr = MCRegister();
+          GFX90APendingDSReadDefs.clear();
+        }
+      }
+
+      if (GFX90AMarkNextDSRead) {
+        GFX90AMarkNextDSRead = false;
+        GFX90AHasPendingDSRead = true;
+        if (GFX90AHazardPolicy ==
+                GFX90ADirectLDSHazardPolicy::Automatic &&
+            Inst.getOpcode() != AMDGPU::DS_READ_B32_vi)
+          return Error(IDLoc, "automatic gfx90a direct-LDS hazard repair is "
+                              "currently supported only for ds_read_b32");
+        GFX90APendingDSRead = Inst;
+        GFX90APendingDSReadLoc = IDLoc;
+        int AddrIdx = AMDGPU::getNamedOperandIdx(Inst.getOpcode(),
+                                                 AMDGPU::OpName::addr);
+        assert(AddrIdx >= 0 && unsigned(AddrIdx) < Inst.getNumOperands() &&
+               Inst.getOperand(AddrIdx).isReg());
+        GFX90APendingDSReadAddr = Inst.getOperand(AddrIdx).getReg();
+        GFX90APendingDSReadDefs.clear();
+        for (unsigned I = 0, E = std::min<unsigned>(Desc.getNumDefs(),
+                                                    Inst.getNumOperands());
+             I != E; ++I) {
+          if (!Inst.getOperand(I).isReg())
+            continue;
+          MCRegister Def = Inst.getOperand(I).getReg();
+          if (GFX90AHazardPolicy ==
+                  GFX90ADirectLDSHazardPolicy::Automatic &&
+              getMRI()->regsOverlap(Def, GFX90APendingDSReadAddr))
+            return Error(IDLoc, "automatic gfx90a direct-LDS hazard repair "
+                                "requires distinct DS-read destination and "
+                                "address registers");
+          if (getMRI()->regsOverlap(Def, GFX90ADummyVGPR))
+            return Error(IDLoc, "gfx90a direct-LDS hazard scratch VGPR must "
+                                "not overlap the marked read destination");
+          GFX90APendingDSReadDefs.push_back(Def);
+        }
+      }
+    }
+
     Out.emitInstruction(Inst, getSTI());
     // Record for kernel prologue checking.
     OpcodeStream.push_back(Inst.getOpcode());
@@ -7035,6 +7161,49 @@ bool AMDGPUAsmParser::ParseDirectiveAMDGPULDS() {
   return false;
 }
 
+bool AMDGPUAsmParser::ParseDirectiveGFX90ADirectLDSHazard() {
+  if (!isGFX90A() || isGFX940())
+    return TokError("directive is only supported on gfx90a-class targets");
+
+  StringRef Mode;
+  if (getParser().parseIdentifier(Mode))
+    return TokError("expected automatic, manual, or manual_no_warn");
+  if (parseEOL())
+    return true;
+
+  if (Mode == "automatic")
+    GFX90AHazardPolicy = GFX90ADirectLDSHazardPolicy::Automatic;
+  else if (Mode == "manual")
+    GFX90AHazardPolicy = GFX90ADirectLDSHazardPolicy::Manual;
+  else if (Mode == "manual_no_warn")
+    GFX90AHazardPolicy = GFX90ADirectLDSHazardPolicy::ManualNoWarn;
+  else
+    return Error(getLoc(), "expected automatic, manual, or manual_no_warn");
+  return false;
+}
+
+bool AMDGPUAsmParser::ParseDirectiveGFX90ADirectLDSRead() {
+  if (!isGFX90A() || isGFX940())
+    return TokError("directive is only supported on gfx90a-class targets");
+  if (GFX90AMarkNextDSRead)
+    return Error(getLoc(), "previous direct-LDS read marker is still pending");
+
+  MCRegister Scratch;
+  SMLoc StartLoc;
+  SMLoc EndLoc;
+  if (parseRegister(Scratch, StartLoc, EndLoc))
+    return TokError("expected a 32-bit VGPR for the automatic dummy read");
+  if (!AMDGPU::VGPR_32RegClass.contains(Scratch))
+    return Error(StartLoc, "direct-LDS hazard scratch register must be a "
+                           "32-bit VGPR");
+  if (parseEOL())
+    return true;
+
+  GFX90ADummyVGPR = Scratch;
+  GFX90AMarkNextDSRead = true;
+  return false;
+}
+
 bool AMDGPUAsmParser::ParseDirectiveAMDGPUInfo() {
   if (getParser().checkForValidSection())
     return true;
@@ -7148,7 +7317,53 @@ bool AMDGPUAsmParser::ParseDirectiveAMDGPUInfo() {
   return false;
 }
 
+void AMDGPUAsmParser::resolveGFX90ADirectLDSHazard(MCStreamer &Out,
+                                                    SMLoc Loc,
+                                                    StringRef Reason) {
+  assert(GFX90AHasPendingDSRead);
+  if (GFX90AHazardPolicy == GFX90ADirectLDSHazardPolicy::Automatic) {
+    MCInst DummyRead;
+    DummyRead.setOpcode(AMDGPU::DS_READ_B32_vi);
+    DummyRead.setLoc(Loc);
+    DummyRead.addOperand(MCOperand::createReg(GFX90ADummyVGPR));
+    DummyRead.addOperand(MCOperand::createReg(GFX90APendingDSReadAddr));
+    DummyRead.addOperand(MCOperand::createImm(0));
+    DummyRead.addOperand(MCOperand::createImm(0));
+    Out.emitInstruction(DummyRead, getSTI());
+    OpcodeStream.push_back(DummyRead.getOpcode());
+
+    MCInst CopyResult;
+    CopyResult.setOpcode(AMDGPU::V_MOV_B32_e32_vi);
+    CopyResult.setLoc(Loc);
+    CopyResult.addOperand(
+        MCOperand::createReg(GFX90APendingDSReadDefs.front()));
+    CopyResult.addOperand(MCOperand::createReg(GFX90ADummyVGPR));
+    Out.emitInstruction(CopyResult, getSTI());
+    OpcodeStream.push_back(CopyResult.getOpcode());
+  } else if (GFX90AHazardPolicy == GFX90ADirectLDSHazardPolicy::Manual) {
+    Warning(Loc, "gfx90a direct-LDS read hazard is not resolved before " +
+                     Reason + "; assembly is unchanged in manual mode");
+    Warning(GFX90APendingDSReadLoc,
+            "the marked direct-LDS read requiring a later DS operation is "
+            "here");
+  }
+  GFX90AHasPendingDSRead = false;
+  GFX90APendingDSReadAddr = MCRegister();
+  GFX90APendingDSReadDefs.clear();
+}
+
 void AMDGPUAsmParser::doBeforeLabelEmit(MCSymbol *Symbol, SMLoc IDLoc) {
+  if (isGFX90A() && !isGFX940()) {
+    if (GFX90AMarkNextDSRead) {
+      Error(IDLoc, ".amdgpu_gfx90a_direct_lds_read must be followed by a DS "
+                   "read instruction before a label");
+      GFX90AMarkNextDSRead = false;
+    }
+    if (GFX90AHasPendingDSRead)
+      resolveGFX90ADirectLDSHazard(getParser().getStreamer(), IDLoc,
+                                  "a label is emitted");
+  }
+
   // Record every parsed label in the timeline so that, at end of file, the
   // instructions following a kernel's label can be located regardless of
   // whether the .amdhsa_kernel directive came before or after the label.
@@ -7180,6 +7395,14 @@ void AMDGPUAsmParser::checkKernelPrologues() {
 
 void AMDGPUAsmParser::onEndOfFile() {
   emitTargetDirective();
+  if (isGFX90A() && !isGFX940()) {
+    if (GFX90AMarkNextDSRead)
+      Error(getLoc(), ".amdgpu_gfx90a_direct_lds_read is not followed by a "
+                      "DS read instruction");
+    if (GFX90AHasPendingDSRead)
+      resolveGFX90ADirectLDSHazard(getParser().getStreamer(), getLoc(),
+                                  "the input file ends");
+  }
   checkKernelPrologues();
   if (InfoData)
     getTargetStreamer().emitAMDGPUInfo(*InfoData);
@@ -7224,6 +7447,12 @@ bool AMDGPUAsmParser::ParseDirective(AsmToken DirectiveID) {
 
   if (IDVal == ".amdgpu_info")
     return ParseDirectiveAMDGPUInfo();
+
+  if (IDVal == ".amdgpu_gfx90a_direct_lds_hazard")
+    return ParseDirectiveGFX90ADirectLDSHazard();
+
+  if (IDVal == ".amdgpu_gfx90a_direct_lds_read")
+    return ParseDirectiveGFX90ADirectLDSRead();
 
   if (IDVal == PALMD::AssemblerDirectiveBegin)
     return ParseDirectivePALMetadataBegin();
