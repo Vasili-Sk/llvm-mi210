@@ -298,6 +298,14 @@ void llvm::verifyAMDGPUIntrinsicCall(VerifierSupport &VS, Intrinsic::ID ID,
         "llvm.amdgcn.s.prefetch.data only supports global or constant memory");
     break;
   }
+  case Intrinsic::amdgcn_global_load_lds_base: {
+    uint64_t Size = cast<ConstantInt>(Call.getArgOperand(3))->getZExtValue();
+    Check(Size == 4 || Size == 8 || Size == 12 || Size == 16,
+          "invalid data size for gfx90a explicit load-to-LDS intrinsic; "
+          "must be 4, 8, 12, or 16",
+          &Call);
+    break;
+  }
   case Intrinsic::amdgcn_load_to_lds:
   case Intrinsic::amdgcn_load_async_to_lds:
   case Intrinsic::amdgcn_global_load_lds:

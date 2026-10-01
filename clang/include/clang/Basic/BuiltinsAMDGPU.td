@@ -442,6 +442,7 @@ def __builtin_amdgcn_ds_atomic_fadd_v2f16 : AMDGPUBuiltin<"_Vector<2, _Float16>(
 def __builtin_amdgcn_load_to_lds : AMDGPUBuiltin<"void(void *, void address_space<3> *, _Constant unsigned int, _Constant int, _Constant unsigned int)", [], "vmem-to-lds-load-insts">;
 def __builtin_amdgcn_load_async_to_lds : AMDGPUBuiltin<"void(void *, void address_space<3> *, _Constant unsigned int, _Constant int, _Constant unsigned int)", [], "vmem-to-lds-load-insts">;
 def __builtin_amdgcn_global_load_lds : AMDGPUBuiltin<"void(void address_space<1> *, void address_space<3> *, _Constant unsigned int, _Constant int, _Constant unsigned int)", [], "vmem-to-lds-load-insts">;
+def __builtin_amdgcn_global_load_lds_base : AMDGPUBuiltin<"void(void address_space<1> *, unsigned int, void address_space<3> *, _Constant unsigned int, _Constant unsigned int)", [], "gfx90a-insts">;
 def __builtin_amdgcn_global_load_async_lds : AMDGPUBuiltin<"void(void address_space<1> *, void address_space<3> *, _Constant unsigned int, _Constant int, _Constant unsigned int)", [], "vmem-to-lds-load-insts">;
 
 //===----------------------------------------------------------------------===//

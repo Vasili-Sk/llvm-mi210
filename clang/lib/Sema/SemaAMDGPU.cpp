@@ -52,6 +52,37 @@ bool SemaAMDGPU::CheckAMDGCNBuiltinFunctionCall(const TargetInfo &TI,
       Builtin::evaluateRequiredTargetFeatures("gfx940-insts", CallerFeatureMap);
 
   switch (BuiltinID) {
+  case AMDGPU::BI__builtin_amdgcn_global_load_lds_base: {
+    if (!HasGFX90AInsts || HasGFX940Insts) {
+      SemaRef.targetDiag(TheCall->getExprLoc(),
+                         diag::err_amdgcn_global_load_lds_base_target);
+      return true;
+    }
+
+    constexpr unsigned SizeIdx = 3;
+    llvm::APSInt Size;
+    Expr *ArgExpr = TheCall->getArg(SizeIdx);
+    if (ArgExpr->isInstantiationDependent())
+      return false;
+    ExprResult R = SemaRef.VerifyIntegerConstantExpression(ArgExpr, &Size);
+    if (R.isInvalid())
+      return true;
+    switch (Size.getSExtValue()) {
+    case 4:
+    case 8:
+    case 12:
+    case 16:
+      return false;
+    default:
+      SemaRef.targetDiag(ArgExpr->getExprLoc(),
+                         diag::err_amdgcn_load_lds_size_invalid_value)
+          << ArgExpr->getSourceRange();
+      SemaRef.targetDiag(ArgExpr->getExprLoc(),
+                         diag::note_amdgcn_load_lds_size_valid_value)
+          << 3 << ArgExpr->getSourceRange();
+      return true;
+    }
+  }
   case AMDGPU::BI__builtin_amdgcn_raw_ptr_buffer_load_lds:
   case AMDGPU::BI__builtin_amdgcn_raw_ptr_buffer_load_async_lds:
   case AMDGPU::BI__builtin_amdgcn_struct_ptr_buffer_load_lds:

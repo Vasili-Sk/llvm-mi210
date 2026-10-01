@@ -1912,6 +1912,31 @@ void SITargetLowering::getTgtMemIntrinsic(SmallVectorImpl<IntrinsicInfo> &Infos,
     Infos.push_back(Info);
     return;
   }
+  case Intrinsic::amdgcn_global_load_lds_base: {
+    unsigned Width = cast<ConstantInt>(CI.getArgOperand(3))->getZExtValue();
+    auto *Aux = cast<ConstantInt>(CI.getArgOperand(4));
+    bool IsVolatile = Aux->getZExtValue() & AMDGPU::CPol::VOLATILE;
+    if (IsVolatile)
+      Flags |= MachineMemOperand::MOVolatile;
+
+    // The dynamic per-lane byte offset is an explicit instruction operand.
+    // Keep the uniform global base as the load alias identity.
+    Info.opc = ISD::INTRINSIC_VOID;
+    Info.memVT = EVT::getIntegerVT(CI.getContext(), Width * 8);
+    Info.ptrVal = CI.getArgOperand(0);
+    Info.flags = Flags | MachineMemOperand::MOLoad;
+    Infos.push_back(Info);
+
+    // m0 names the uniform LDS base. Hardware adds lane_id * 4. Model the
+    // complete wave destination so alias analysis cannot treat this as one
+    // ordinary local-pointer store.
+    Info.memVT = EVT::getIntegerVT(CI.getContext(),
+                                   Width * 8 * Subtarget->getWavefrontSize());
+    Info.ptrVal = CI.getArgOperand(2);
+    Info.flags = Flags | MachineMemOperand::MOStore;
+    Infos.push_back(Info);
+    return;
+  }
   case Intrinsic::amdgcn_load_to_lds:
   case Intrinsic::amdgcn_load_async_to_lds:
   case Intrinsic::amdgcn_global_load_lds:
@@ -2017,6 +2042,9 @@ bool SITargetLowering::getAddrModeArguments(const IntrinsicInst *II,
   case Intrinsic::amdgcn_av_load_b128:
   case Intrinsic::amdgcn_av_store_b128:
     Ptr = II->getArgOperand(0);
+    break;
+  case Intrinsic::amdgcn_global_load_lds_base:
+    Ptr = II->getArgOperand(2);
     break;
   case Intrinsic::amdgcn_load_to_lds:
   case Intrinsic::amdgcn_load_async_to_lds:
@@ -13010,6 +13038,53 @@ SDValue SITargetLowering::LowerINTRINSIC_VOID(SDValue Op,
     auto *Load = DAG.getMachineNode(Opc, DL, M->getVTList(), Ops);
     DAG.setNodeMemRefs(Load, M->memoperands());
 
+    return SDValue(Load, 0);
+  }
+  case Intrinsic::amdgcn_global_load_lds_base: {
+    auto Diagnose = [&](const Twine &Message) {
+      DAG.getContext()->diagnose(DiagnosticInfoUnsupported(
+          DAG.getMachineFunction().getFunction(), Message, DL.getDebugLoc()));
+      return Chain;
+    };
+    if (!Subtarget->hasGFX90AInsts() || Subtarget->hasGFX940Insts())
+      return Diagnose("explicit global-to-LDS base contract requires gfx90a");
+
+    SDValue SAddr = Op.getOperand(2);
+    SDValue VOffset = Op.getOperand(3);
+    SDValue LDSBase = Op.getOperand(4);
+    // The intrinsic contract promises that both bases are wave-uniform.
+    // SelectionDAG divergence analysis cannot prove this for all valid values,
+    // such as an LDS base selected by a wave index within a workgroup.
+
+    unsigned Opc;
+    switch (Op->getConstantOperandVal(5)) {
+    default:
+      return Diagnose("invalid explicit global-to-LDS width");
+    case 4:
+      Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORD_SADDR;
+      break;
+    case 8:
+      Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX2_SADDR;
+      break;
+    case 12:
+      Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX3_SADDR;
+      break;
+    case 16:
+      Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX4_SADDR;
+      break;
+    }
+
+    SDValue M0Val = copyToM0(DAG, Chain, DL, LDSBase);
+    unsigned Aux = Op.getConstantOperandVal(6);
+    SmallVector<SDValue, 7> Ops{
+        SAddr, VOffset, DAG.getTargetConstant(0, DL, MVT::i32),
+        DAG.getTargetConstant(Aux & ~AMDGPU::CPol::VIRTUAL_BITS, DL,
+                              MVT::i32),
+        DAG.getTargetConstant(0, DL, MVT::i8), M0Val.getValue(0),
+        M0Val.getValue(1)};
+    auto *M = cast<MemSDNode>(Op);
+    auto *Load = DAG.getMachineNode(Opc, DL, M->getVTList(), Ops);
+    DAG.setNodeMemRefs(Load, M->memoperands());
     return SDValue(Load, 0);
   }
   // Buffers are handled by LowerBufferFatPointers, and we're going to go

@@ -2940,6 +2940,24 @@ class AMDGPUGlobalLoadLDS : Intrinsic<
            IntrNoCallback, IntrNoFree],
           "", [SDNPMemOperand]>;
 def int_amdgcn_global_load_lds : AMDGPUGlobalLoadLDS, ClangBuiltin<"__builtin_amdgcn_global_load_lds">;
+
+// gfx90a direct-to-LDS contract. The source address is the wave-uniform
+// global base plus the per-lane byte offset. The destination is the
+// wave-uniform LDS byte base plus lane_id * 4.
+def int_amdgcn_global_load_lds_base : Intrinsic<
+          [],
+          [LLVMQualPointerType<1>, // Wave-uniform global base pointer
+           llvm_i32_ty,            // Per-lane global byte offset
+           LLVMQualPointerType<3>, // Wave-uniform LDS byte base for m0
+           llvm_i32_ty,            // Data byte size: 4, 8, 12, or 16
+           llvm_i32_ty],           // Cache policy and volatile auxiliary bits
+          [IntrWillReturn, IntrArgMemOnly,
+           NoCapture<ArgIndex<0>>, ReadOnly<ArgIndex<0>>,
+           NoCapture<ArgIndex<2>>, WriteOnly<ArgIndex<2>>,
+           ImmArg<ArgIndex<3>>, ImmArg<ArgIndex<4>>,
+           IntrNoCallback, IntrNoFree],
+          "", [SDNPMemOperand]>,
+          ClangBuiltin<"__builtin_amdgcn_global_load_lds_base">;
 def int_amdgcn_global_load_async_lds : AMDGPUGlobalLoadLDS, ClangBuiltin<"__builtin_amdgcn_global_load_async_lds">;
 
 // This is IntrHasSideEffects because it reads from a volatile hardware register.

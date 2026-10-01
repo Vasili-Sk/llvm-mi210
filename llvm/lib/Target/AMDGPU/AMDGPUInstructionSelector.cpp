@@ -2428,6 +2428,7 @@ bool AMDGPUInstructionSelector::selectG_INTRINSIC_W_SIDE_EFFECTS(
   // arguments by having tto MachineMemOperands on an intrinsic, we just trust
   // that the argument is a global pointer (buffer pointers have been handled by
   // a LLVM IR-level lowering).
+  case Intrinsic::amdgcn_global_load_lds_base:
   case Intrinsic::amdgcn_load_to_lds:
   case Intrinsic::amdgcn_load_async_to_lds:
   case Intrinsic::amdgcn_global_load_lds:
@@ -3751,8 +3752,17 @@ bool AMDGPUInstructionSelector::selectGlobalLoadLds(MachineInstr &MI) const{
     return false;
 
   unsigned Opc;
-  unsigned Size = MI.getOperand(3).getImm();
   Intrinsic::ID IntrinsicID = cast<GIntrinsic>(MI).getIntrinsicID();
+  bool IsExplicitBase = IntrinsicID == Intrinsic::amdgcn_global_load_lds_base;
+  if (IsExplicitBase &&
+      (!Subtarget->hasGFX90AInsts() || Subtarget->hasGFX940Insts())) {
+    MF->getFunction().getContext().diagnose(DiagnosticInfoUnsupported(
+        MF->getFunction(),
+        "explicit global-to-LDS base contract requires gfx90a",
+        MI.getDebugLoc()));
+    return false;
+  }
+  unsigned Size = MI.getOperand(IsExplicitBase ? 4 : 3).getImm();
 
   switch (Size) {
   default:
@@ -3788,13 +3798,14 @@ bool AMDGPUInstructionSelector::selectGlobalLoadLds(MachineInstr &MI) const{
   MachineBasicBlock *MBB = MI.getParent();
   const DebugLoc &DL = MI.getDebugLoc();
   BuildMI(*MBB, &MI, DL, TII.get(AMDGPU::COPY), AMDGPU::M0)
-    .add(MI.getOperand(2));
+      .add(MI.getOperand(IsExplicitBase ? 3 : 2));
 
   Register Addr = MI.getOperand(1).getReg();
-  Register VOffset;
-  // Try to split SAddr and VOffset. Global and LDS pointers share the same
-  // immediate offset, so we cannot use a regular SelectGlobalSAddr().
-  if (!isSGPR(Addr)) {
+  Register VOffset =
+      IsExplicitBase ? MI.getOperand(2).getReg() : Register();
+  // Try to split SAddr and VOffset for the compatible pointer contract.
+  // The explicit contract already carries these as separate operands.
+  if (!IsExplicitBase && !isSGPR(Addr)) {
     auto AddrDef = getDefSrcRegIgnoringCopies(Addr, *MRI);
     if (isSGPR(AddrDef->Reg)) {
       Addr = AddrDef->Reg;
@@ -3809,6 +3820,13 @@ bool AMDGPUInstructionSelector::selectGlobalLoadLds(MachineInstr &MI) const{
         }
       }
     }
+  }
+
+  if (IsExplicitBase && !isSGPR(Addr)) {
+    MF->getFunction().getContext().diagnose(DiagnosticInfoUnsupported(
+        MF->getFunction(),
+        "explicit global-to-LDS global base must be wave-uniform", DL));
+    return false;
   }
 
   if (isSGPR(Addr)) {
@@ -3826,7 +3844,10 @@ bool AMDGPUInstructionSelector::selectGlobalLoadLds(MachineInstr &MI) const{
   if (isSGPR(Addr))
     MIB.addReg(VOffset);
 
-  MIB.add(MI.getOperand(4)); // offset
+  if (IsExplicitBase)
+    MIB.addImm(0);
+  else
+    MIB.add(MI.getOperand(4)); // offset
 
   unsigned Aux = MI.getOperand(5).getImm();
   MIB.addImm(Aux & ~AMDGPU::CPol::VIRTUAL_BITS); // cpol
@@ -3844,10 +3865,12 @@ bool AMDGPUInstructionSelector::selectGlobalLoadLds(MachineInstr &MI) const{
   assert(LoadMMO && StoreMMO);
 
   MachinePointerInfo LoadPtrI = LoadMMO->getPointerInfo();
-  LoadPtrI.Offset = MI.getOperand(4).getImm();
-  LoadPtrI.V = PoisonValue::get(PointerType::get(MF->getFunction().getContext(),
-                                                 AMDGPUAS::GLOBAL_ADDRESS));
-  LoadPtrI.AddrSpace = AMDGPUAS::GLOBAL_ADDRESS;
+  LoadPtrI.Offset = IsExplicitBase ? 0 : MI.getOperand(4).getImm();
+  if (!IsExplicitBase) {
+    LoadPtrI.V = PoisonValue::get(PointerType::get(
+        MF->getFunction().getContext(), AMDGPUAS::GLOBAL_ADDRESS));
+    LoadPtrI.AddrSpace = AMDGPUAS::GLOBAL_ADDRESS;
+  }
   auto LoadFlags = LoadMMO->getFlags() &
                    ~(MachineMemOperand::MOStore | MachineMemOperand::MOLoad);
   LoadMMO = MF->getMachineMemOperand(
@@ -3855,7 +3878,7 @@ bool AMDGPUInstructionSelector::selectGlobalLoadLds(MachineInstr &MI) const{
       LoadMMO->getBaseAlign());
 
   MachinePointerInfo StorePtrI = StoreMMO->getPointerInfo();
-  StorePtrI.Offset = MI.getOperand(4).getImm();
+  StorePtrI.Offset = IsExplicitBase ? 0 : MI.getOperand(4).getImm();
   auto StoreFlags = StoreMMO->getFlags() &
                     ~(MachineMemOperand::MOStore | MachineMemOperand::MOLoad);
   StoreMMO = MF->getMachineMemOperand(

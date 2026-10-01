@@ -3342,6 +3342,12 @@ void AMDGPURegisterBankInfo::applyMappingImpl(
       constrainOpWithReadfirstlane(B, MI, 5);
       return;
     }
+    case Intrinsic::amdgcn_global_load_lds_base: {
+      applyDefaultMapping(OpdMapper);
+      // The contract requires both bases to arrive in scalar registers. Do not
+      // recover them from lane values with readfirstlane.
+      return;
+    }
     case Intrinsic::amdgcn_load_to_lds:
     case Intrinsic::amdgcn_load_async_to_lds:
     case Intrinsic::amdgcn_global_load_lds:
@@ -5596,6 +5602,12 @@ AMDGPURegisterBankInfo::getInstrMapping(const MachineInstr &MI) const {
       OpdsMapping[1] = getVGPROpMapping(MI.getOperand(1).getReg(), MRI, *TRI);
       // LDS address goes into $vdst/$vdata (VGPR).
       OpdsMapping[2] = getVGPROpMapping(MI.getOperand(2).getReg(), MRI, *TRI);
+      break;
+    }
+    case Intrinsic::amdgcn_global_load_lds_base: {
+      OpdsMapping[1] = getSGPROpMapping(MI.getOperand(1).getReg(), MRI, *TRI);
+      OpdsMapping[2] = getVGPROpMapping(MI.getOperand(2).getReg(), MRI, *TRI);
+      OpdsMapping[3] = getSGPROpMapping(MI.getOperand(3).getReg(), MRI, *TRI);
       break;
     }
     case Intrinsic::amdgcn_load_to_lds:

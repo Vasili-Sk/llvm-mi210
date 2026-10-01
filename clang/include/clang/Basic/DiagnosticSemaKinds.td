@@ -14340,7 +14340,8 @@ def note_amdgpu_named_barrier_reason_inherited : Note<
 
 // AMDGCN builtins diagnostics
 def err_amdgcn_load_lds_size_invalid_value : Error<"invalid size value">;
-def note_amdgcn_load_lds_size_valid_value : Note<"size must be %select{1, 2, or 4|1, 2, 4, 12 or 16|1, 2, 4, 8, 12 or 16}0">;
+def note_amdgcn_load_lds_size_valid_value : Note<"size must be %select{1, 2, or 4|1, 2, 4, 12 or 16|1, 2, 4, 8, 12 or 16|4, 8, 12, or 16}0">;
+def err_amdgcn_global_load_lds_base_target : Error<"explicit global-to-LDS base contract requires gfx90a">;
 def err_invalid_sync_scope
     : Error<"unsupported atomic synchronization scope '%0'">;
 def err_amdgcn_processor_is_arg_not_literal
