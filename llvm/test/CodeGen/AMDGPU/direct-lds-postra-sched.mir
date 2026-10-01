@@ -1,0 +1,81 @@
+# RUN: llc -mtriple=amdgcn-amd-amdhsa -mcpu=gfx90a -run-pass=postmisched %s -o - | FileCheck %s
+
+# The explicit LDS base is not an encoded VMEM SGPR input. The direct-load
+# latency also gives pending LDS production priority over an independent
+# address chain that feeds a later global load.
+---
+name: direct_before_independent_address
+tracksRegLiveness: true
+body: |
+  ; CHECK-LABEL: name: direct_before_independent_address
+  ; CHECK: GLOBAL_LOAD_LDS_DWORDX4_SADDR_BASE {{.*}}$vgpr0, {{.*}}$sgpr4
+  ; CHECK: $sgpr5 = V_READFIRSTLANE_B32 {{.*}}$vgpr2
+  ; CHECK-NEXT: GLOBAL_LOAD_LDS_DWORDX4_SADDR_BASE {{.*}}$vgpr1, {{.*}}$sgpr5
+  ; CHECK-NEXT: $vgpr12 = V_ADD_U32_e32
+  ; CHECK-NEXT: $vgpr4_vgpr5 = V_LSHLREV_B64_e64
+  ; CHECK-NEXT: $vgpr6 = V_ADD_CO_U32_e32
+  ; CHECK-NEXT: $vgpr7 = V_ADDC_U32_e32
+  ; CHECK-NEXT: $vgpr8_vgpr9_vgpr10_vgpr11 = GLOBAL_LOAD_DWORDX4
+  ; CHECK-NOT: S_NOP
+  bb.0:
+    liveins: $sgpr0_sgpr1, $sgpr4, $sgpr6, $vgpr0, $vgpr1, $vgpr2, $vgpr13, $vgpr14, $vgpr15_vgpr16
+    GLOBAL_LOAD_LDS_DWORDX4_SADDR_BASE $sgpr0_sgpr1, $vgpr0, $sgpr4, 0, 0, 0, implicit $exec
+    $sgpr5 = V_READFIRSTLANE_B32 $vgpr2, implicit $exec
+    GLOBAL_LOAD_LDS_DWORDX4_SADDR_BASE $sgpr0_sgpr1, $vgpr1, $sgpr5, 0, 0, 0, implicit $exec
+    $vgpr12 = V_ADD_U32_e32 $sgpr6, $vgpr14, implicit $exec
+    $vgpr4_vgpr5 = V_LSHLREV_B64_e64 4, $vgpr12_vgpr13, implicit $exec
+    $vgpr6 = V_ADD_CO_U32_e32 $vgpr15, $vgpr4, implicit-def $vcc, implicit $exec
+    $vgpr7 = V_ADDC_U32_e32 $vgpr16, $vgpr5, implicit-def dead $vcc, implicit $vcc, implicit $exec
+    $vgpr8_vgpr9_vgpr10_vgpr11 = GLOBAL_LOAD_DWORDX4 $vgpr6_vgpr7, 0, 0, implicit $exec
+    S_ENDPGM 0
+...
+
+# A true address dependency still blocks the direct load.
+---
+name: true_dependency_is_preserved
+tracksRegLiveness: true
+body: |
+  ; CHECK-LABEL: name: true_dependency_is_preserved
+  ; CHECK: $vgpr1 = V_ADD_U32_e32
+  ; CHECK-NEXT: GLOBAL_LOAD_LDS_DWORDX4_SADDR_BASE {{.*}}$vgpr1, {{.*}}$sgpr4
+  ; CHECK-NOT: S_NOP
+  bb.0:
+    liveins: $sgpr0_sgpr1, $sgpr4, $sgpr5, $vgpr0
+    $vgpr1 = V_ADD_U32_e32 $sgpr5, $vgpr0, implicit $exec
+    GLOBAL_LOAD_LDS_DWORDX4_SADDR_BASE $sgpr0_sgpr1, $vgpr1, $sgpr4, 0, 0, 0, implicit $exec
+    S_ENDPGM 0
+...
+
+# Scheduling does not cross a control-flow boundary.
+---
+name: branch_boundary_is_preserved
+tracksRegLiveness: true
+body: |
+  ; CHECK-LABEL: name: branch_boundary_is_preserved
+  ; CHECK: S_BRANCH %bb.1
+  ; CHECK: bb.1:
+  ; CHECK: GLOBAL_LOAD_LDS_DWORDX4_SADDR_BASE
+  bb.0:
+    successors: %bb.1
+    S_BRANCH %bb.1
+  bb.1:
+    liveins: $sgpr0_sgpr1, $sgpr4, $vgpr0
+    GLOBAL_LOAD_LDS_DWORDX4_SADDR_BASE $sgpr0_sgpr1, $vgpr0, $sgpr4, 0, 0, 0, implicit $exec
+    S_ENDPGM 0
+...
+
+# A function without a direct pseudo is unchanged by the new schedule class.
+---
+name: classic_no_direct
+tracksRegLiveness: true
+body: |
+  ; CHECK-LABEL: name: classic_no_direct
+  ; CHECK: $vgpr1 = V_ADD_U32_e32
+  ; CHECK-NEXT: $vgpr2 = V_XOR_B32_e32
+  ; CHECK-NEXT: S_ENDPGM
+  bb.0:
+    liveins: $sgpr0, $vgpr0
+    $vgpr1 = V_ADD_U32_e32 $sgpr0, $vgpr0, implicit $exec
+    $vgpr2 = V_XOR_B32_e32 7, $vgpr1, implicit $exec
+    S_ENDPGM 0
+...

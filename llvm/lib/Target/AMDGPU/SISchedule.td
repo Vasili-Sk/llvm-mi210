@@ -22,6 +22,8 @@ def WriteLDS    : SchedWrite;
 def WriteSALU   : SchedWrite;
 def WriteSMEM   : SchedWrite;
 def WriteVMEM   : SchedWrite;
+// Model the extra issue head start needed by VMEM writes that produce LDS data.
+def WriteDirectLDS : SchedWrite;
 def WriteBarrier : SchedWrite;
 
 def MIVGPRRead  : SchedRead;
@@ -181,6 +183,7 @@ multiclass SICommonWriteRes {
   def : HWWriteRes<WriteSALU,    [HWSALU],   1>;
   def : HWWriteRes<WriteSMEM,    [HWLGKM],   5>;
   def : HWWriteRes<WriteVMEM,    [HWVMEM],   80>;
+  def : HWWriteRes<WriteDirectLDS, [HWVMEM],  85>;
   def : HWWriteRes<WriteBarrier, [HWBranch], 500>; // XXX: Guessed ???
 
   def : HWVALUWriteRes<Write32Bit,         1>;
@@ -411,6 +414,7 @@ def : HWWriteRes<WriteLDS,           [HWLGKM,   HWRC], 20>;
 def : HWWriteRes<WriteSALU,          [HWSALU,   HWRC], 2>;
 def : HWWriteRes<WriteSMEM,          [HWLGKM,   HWRC], 20>;
 def : HWWriteRes<WriteVMEM,          [HWVMEM,   HWRC], 320>;
+def : HWWriteRes<WriteDirectLDS,     [HWVMEM,   HWRC], 325>;
 def : HWWriteRes<WriteBarrier,       [HWBranch],       2000>;
 
 def : UnsupportedWriteRes<WriteSFPU>;
@@ -451,6 +455,7 @@ def : HWWriteRes<WriteSALU,          [HWSALU,   HWRC], 2>;
 def : HWWriteRes<WriteSFPU,          [HWSALU,   HWRC], 4>;
 def : HWWriteRes<WriteSMEM,          [HWLGKM,   HWRC], 20>;
 def : HWWriteRes<WriteVMEM,          [HWVMEM,   HWRC], 320>;
+def : HWWriteRes<WriteDirectLDS,     [HWVMEM,   HWRC], 325>;
 def : HWWriteRes<WriteBarrier,       [HWBranch],       2000>;
 } // End RetireOOO = 1
 
@@ -487,6 +492,7 @@ def : HWWriteRes<WriteSALU,              [HWSALU,   HWRC], 2>;
 def : HWWriteRes<WriteSFPU,              [HWSALU,   HWRC], 4>;
 def : HWWriteRes<WriteSMEM,              [HWLGKM,   HWRC], 20>;
 def : HWWriteRes<WriteVMEM,              [HWVMEM,   HWRC], 320>;
+def : HWWriteRes<WriteDirectLDS,         [HWVMEM,   HWRC], 325>;
 def : HWWriteRes<WriteBarrier,           [HWBranch],       2000>;
 
 def : InstRW<[WriteCopy], (instrs COPY)>;
@@ -592,6 +598,7 @@ def : HWWriteRes<WriteSALU,              [HWSALU,   HWRC], 2>;
 def : HWWriteRes<WriteSFPU,              [HWSALU,   HWRC], 4>;
 def : HWWriteRes<WriteSMEM,              [HWLGKM,   HWRC], 20>;
 def : HWWriteRes<WriteVMEM,              [HWVMEM,   HWRC], 320>;
+def : HWWriteRes<WriteDirectLDS,         [HWVMEM,   HWRC], 325>;
 def : HWWriteRes<WriteBarrier,           [HWBranch],       2000>;
 
 def : InstRW<[WriteCopy], (instrs COPY)>;

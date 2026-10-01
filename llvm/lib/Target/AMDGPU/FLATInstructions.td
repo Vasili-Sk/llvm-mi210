@@ -1240,7 +1240,7 @@ class GFX90A_Global_Load_LDS_Base_Pseudo<string Name> : FLAT_Pseudo<
   let has_saddr = 1;
   let enabled_saddr = 1;
   let VALU = 1;
-  let SchedRW = [WriteVMEM, WriteLDS];
+  let SchedRW = [WriteDirectLDS, WriteLDS];
 }
 
 def GLOBAL_LOAD_LDS_DWORD_SADDR_BASE :

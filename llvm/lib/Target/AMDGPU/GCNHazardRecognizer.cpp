@@ -1232,8 +1232,15 @@ int GCNHazardRecognizer::checkVMEMHazards(MachineInstr *VMEM) const {
   auto IsHazardDefFn = [this](const MachineInstr &MI) {
     return TII.isVALU(MI, /*AllowLDSDMA=*/true);
   };
+  // An explicit direct-to-LDS pseudo carries its LDS base as an SGPR until
+  // late lowering. The encoded VMEM instruction does not read this operand.
+  // SILowerDirectLDS copies it to m0 and the post-RA hazard pass protects the
+  // real m0 read, so do not reserve the VMEM SGPR hazard window for it here.
+  const MachineOperand *LDSBase =
+      TII.getNamedOperand(*VMEM, AMDGPU::OpName::ldsbase);
   for (const MachineOperand &Use : VMEM->uses()) {
-    if (!Use.isReg() || TRI.isVectorRegister(MF.getRegInfo(), Use.getReg()))
+    if (&Use == LDSBase || !Use.isReg() ||
+        TRI.isVectorRegister(MF.getRegInfo(), Use.getReg()))
       continue;
 
     int WaitStatesNeededForUse =
