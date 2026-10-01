@@ -27,6 +27,7 @@ add_llvm_target_unittest(AMDGPUTests
   AMDGPUUnitTests.cpp
   CSETest.cpp
   DirectLDSLayoutTest.cpp
+  DirectLDSProfitabilityTest.cpp
   DwarfRegMappings.cpp
   ExecMayBeModifiedBeforeAnyUse.cpp
   GCNRegPressureTest.cpp

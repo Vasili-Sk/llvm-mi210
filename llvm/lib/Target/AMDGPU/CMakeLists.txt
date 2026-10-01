@@ -55,6 +55,7 @@ add_llvm_target(AMDGPUCodeGen
   AMDGPUCombinerHelper.cpp
   AMDGPUCtorDtorLowering.cpp
   AMDGPUDirectLDSLayout.cpp
+  AMDGPUDirectLDSProfitability.cpp
   AMDGPUExportClustering.cpp
   AMDGPUExportKernelRuntimeHandles.cpp
   AMDGPUFrameLowering.cpp
