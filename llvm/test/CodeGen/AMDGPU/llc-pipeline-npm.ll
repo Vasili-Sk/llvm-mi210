@@ -169,6 +169,7 @@
 ; GCN-O2-NEXT:     flatten-cfg
 ; GCN-O2-NEXT:     sink
 ; GCN-O2-NEXT:     amdgpu-late-codegenprepare
+; GCN-O2-NEXT:     amdgpu-auto-direct-lds
 ; GCN-O2-NEXT:     amdgpu-unify-divergent-exit-nodes
 ; GCN-O2-NEXT:     fix-irreducible
 ; GCN-O2-NEXT:     unify-loop-exits
@@ -358,6 +359,7 @@
 ; GCN-O3-NEXT:     flatten-cfg
 ; GCN-O3-NEXT:     sink
 ; GCN-O3-NEXT:     amdgpu-late-codegenprepare
+; GCN-O3-NEXT:     amdgpu-auto-direct-lds
 ; GCN-O3-NEXT:     amdgpu-unify-divergent-exit-nodes
 ; GCN-O3-NEXT:     fix-irreducible
 ; GCN-O3-NEXT:     unify-loop-exits

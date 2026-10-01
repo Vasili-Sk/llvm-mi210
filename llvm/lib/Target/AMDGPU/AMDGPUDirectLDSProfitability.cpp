@@ -45,6 +45,10 @@ StringRef AMDGPU::getDirectLDSProfitReasonName(DirectLDSProfitReason Reason) {
     return "not-profitable";
   case DirectLDSProfitReason::OccupancyLossNotPaid:
     return "occupancy-loss-not-paid";
+  case DirectLDSProfitReason::MissingResourceProof:
+    return "missing-resource-proof";
+  case DirectLDSProfitReason::UnenforcedOccupancyProof:
+    return "unenforced-occupancy-proof";
   }
   llvm_unreachable("invalid direct LDS profit reason");
 }
@@ -94,12 +98,6 @@ DirectLDSProfitResult AMDGPU::evaluateDirectLDSProfitability(
   REQUIRE_FACT(AddedHazardRepairInstructionsPerTrip);
   REQUIRE_FACT(AddedM0SetupInstructionsPerTrip);
   REQUIRE_FACT(AddedOtherInstructionsPerTrip);
-  REQUIRE_FACT(RemovedStagingVGPRs);
-  REQUIRE_FACT(ClassicVGPRs);
-  REQUIRE_FACT(DirectVGPRs);
-  REQUIRE_FACT(ClassicOccupancyWaves);
-  REQUIRE_FACT(DirectOccupancyWaves);
-  REQUIRE_FACT(OccupancyLossInstructionCost);
 #undef REQUIRE_FACT
 
   if (*F.LoopTripCount == 0)
@@ -118,19 +116,53 @@ DirectLDSProfitResult AMDGPU::evaluateDirectLDSProfitability(
     return result(DirectLDSProfitReason::InvalidInput);
   if (*F.RemovedDSWritesPerTrip == 0)
     return result(DirectLDSProfitReason::NoRemovedDSWrites);
-  if (*F.RemovedStagingVGPRs == 0)
-    return result(DirectLDSProfitReason::NoRemovedStagingVGPRs);
-  if (*F.ClassicVGPRs == 0 || *F.DirectVGPRs == 0 ||
-      (*F.ClassicVGPRs > *F.DirectVGPRs &&
-       *F.ClassicVGPRs - *F.DirectVGPRs > *F.RemovedStagingVGPRs))
-    return result(DirectLDSProfitReason::RegisterFactsInconsistent);
-  if (*F.ClassicOccupancyWaves == 0 || *F.DirectOccupancyWaves == 0 ||
-      (*F.DirectOccupancyWaves >= *F.ClassicOccupancyWaves &&
-       *F.OccupancyLossInstructionCost != 0))
-    return result(DirectLDSProfitReason::OccupancyFactsInconsistent);
-  if (*F.DirectOccupancyWaves < *F.ClassicOccupancyWaves &&
-      *F.OccupancyLossInstructionCost == 0)
-    return result(DirectLDSProfitReason::OccupancyLossUnpriced);
+  bool HasOccupancyLoss = false;
+  uint64_t OccupancyLossCost = 0;
+  if (F.ResourceProofMode == DirectLDSResourceProofMode::ExactPostRAFacts) {
+    if (!F.RemovedStagingVGPRs)
+      return result(DirectLDSProfitReason::UnknownFact);
+    if (*F.RemovedStagingVGPRs == 0)
+      return result(DirectLDSProfitReason::NoRemovedStagingVGPRs);
+#define REQUIRE_RESOURCE_FACT(Name)                                            \
+  if (!F.Name)                                                                 \
+  return result(DirectLDSProfitReason::UnknownFact)
+    REQUIRE_RESOURCE_FACT(ClassicVGPRs);
+    REQUIRE_RESOURCE_FACT(DirectVGPRs);
+    REQUIRE_RESOURCE_FACT(ClassicOccupancyWaves);
+    REQUIRE_RESOURCE_FACT(DirectOccupancyWaves);
+    REQUIRE_RESOURCE_FACT(OccupancyLossInstructionCost);
+#undef REQUIRE_RESOURCE_FACT
+    if (*F.ClassicVGPRs == 0 || *F.DirectVGPRs == 0 ||
+        (*F.ClassicVGPRs > *F.DirectVGPRs &&
+         *F.ClassicVGPRs - *F.DirectVGPRs > *F.RemovedStagingVGPRs))
+      return result(DirectLDSProfitReason::RegisterFactsInconsistent);
+    if (*F.ClassicOccupancyWaves == 0 || *F.DirectOccupancyWaves == 0 ||
+        (*F.DirectOccupancyWaves >= *F.ClassicOccupancyWaves &&
+         *F.OccupancyLossInstructionCost != 0))
+      return result(DirectLDSProfitReason::OccupancyFactsInconsistent);
+    HasOccupancyLoss = *F.DirectOccupancyWaves < *F.ClassicOccupancyWaves;
+    OccupancyLossCost = *F.OccupancyLossInstructionCost;
+    if (HasOccupancyLoss && OccupancyLossCost == 0)
+      return result(DirectLDSProfitReason::OccupancyLossUnpriced);
+  } else {
+    if (!F.RemovedExclusivePayloadDwords || !F.AddedDivergentOffsetDwords ||
+        !F.NetDivergentDwordDelta || !F.TargetMaxOccupancyWaves ||
+        !F.EffectiveOccupancyWaves || !F.NonRegisterOccupancyWaves ||
+        !F.RegisterBudgetOccupancyWaves || !F.MaxVGPRsAtTargetOccupancy ||
+        !F.MaxSGPRsAtTargetOccupancy)
+      return result(DirectLDSProfitReason::MissingResourceProof);
+    if (*F.RemovedExclusivePayloadDwords == 0 ||
+        *F.AddedDivergentOffsetDwords == 0 ||
+        *F.NetDivergentDwordDelta !=
+            int64_t(*F.AddedDivergentOffsetDwords) -
+                int64_t(*F.RemovedExclusivePayloadDwords) ||
+        *F.NetDivergentDwordDelta > 0 || *F.TargetMaxOccupancyWaves == 0 ||
+        *F.EffectiveOccupancyWaves != *F.TargetMaxOccupancyWaves ||
+        *F.NonRegisterOccupancyWaves != *F.TargetMaxOccupancyWaves ||
+        *F.RegisterBudgetOccupancyWaves != *F.TargetMaxOccupancyWaves ||
+        *F.MaxVGPRsAtTargetOccupancy == 0 || *F.MaxSGPRsAtTargetOccupancy == 0)
+      return result(DirectLDSProfitReason::UnenforcedOccupancyProof);
+  }
 
   auto CheckedAdd = [](uint64_t A, uint64_t B, uint64_t &Sum) {
     if (B > std::numeric_limits<uint64_t>::max() - A)
@@ -189,8 +221,7 @@ DirectLDSProfitResult AMDGPU::evaluateDirectLDSProfitability(
   }
 
   Result.InstructionSaving = ClassicDynamic - DirectDynamic;
-  if (*F.DirectOccupancyWaves < *F.ClassicOccupancyWaves &&
-      Result.InstructionSaving <= *F.OccupancyLossInstructionCost) {
+  if (HasOccupancyLoss && Result.InstructionSaving <= OccupancyLossCost) {
     Result.Reason = DirectLDSProfitReason::OccupancyLossNotPaid;
     return Result;
   }

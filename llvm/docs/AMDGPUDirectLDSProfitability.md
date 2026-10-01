@@ -214,3 +214,23 @@ Evidence:
 Only the committed small tiled fixture is a profitable staged-to-direct calibration. It is not a full GEMM. The verified g12 staged/direct hot cycle ties in executed instruction count and rejects. The model does not use timing to override this result.
 
 The model does not prove tile meaning. It does not predict cache effects, bandwidth, or timing. It does not perform fusion, selection, lowering, scheduling, wait insertion, or hazard repair.
+
+## Pre-RA resource proof mode
+
+Automatic IR fusion must not predict final allocated register counts.
+It uses `GuaranteedPreRAOccupancy` mode.
+The pass obtains the GCN subtarget from the target machine.
+It uses the canonical AMDGPU integer-pair parser and occupancy helpers.
+It requires an effective occupancy equal to the architectural maximum.
+It also requires the exact 64-thread workgroup and sufficient static LDS, workgroup, and barrier resources.
+The target occupancy contract limits the physical VGPR and SGPR allocation sets.
+The pre-RA pressure proof counts four removed exclusive payload dwords and one added divergent offset dword.
+The net divergent dword change is minus three.
+The exact post-RA mode remains for measured machine facts and offline calibration.
+Missing, malformed, clamped, unequal, unsupported, or impossible resource data rejects the candidate.
+
+Malformed `amdgpu-waves-per-eu` text is outside valid code generation input.
+The automatic transform uses a rejection-only syntax screen before it asks the target machine for a subtarget.
+This screen can only return no change.
+It cannot establish a resource fact.
+A well-formed value must still pass the canonical AMDGPU parser and every GCNSubtarget occupancy check.

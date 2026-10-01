@@ -21,7 +21,15 @@ namespace AMDGPU {
 /// units. SetupInstructions executes once for the region. Removed and added
 /// instruction classes must reconcile with the per-trip totals. The caller
 /// must provide every fact. The model does not infer a missing value.
+
+enum class DirectLDSResourceProofMode {
+  ExactPostRAFacts,
+  GuaranteedPreRAOccupancy,
+};
+
 struct DirectLDSCostFacts {
+  DirectLDSResourceProofMode ResourceProofMode =
+      DirectLDSResourceProofMode::ExactPostRAFacts;
   std::optional<uint64_t> LoopTripCount;
   std::optional<uint64_t> ClassicInstructionsPerTrip;
   std::optional<uint64_t> DirectInstructionsPerTrip;
@@ -55,6 +63,19 @@ struct DirectLDSCostFacts {
   /// valid only when occupancy does not decrease. The region instruction
   /// saving must be greater than this cost.
   std::optional<uint64_t> OccupancyLossInstructionCost;
+
+  /// Pre-RA proof facts. This mode does not predict final register counts.
+  /// The exact occupancy value must come from a compiler-enforced equal
+  /// minimum and maximum occupancy contract on the function.
+  std::optional<uint64_t> RemovedExclusivePayloadDwords;
+  std::optional<uint64_t> AddedDivergentOffsetDwords;
+  std::optional<int64_t> NetDivergentDwordDelta;
+  std::optional<uint64_t> TargetMaxOccupancyWaves;
+  std::optional<uint64_t> EffectiveOccupancyWaves;
+  std::optional<uint64_t> NonRegisterOccupancyWaves;
+  std::optional<uint64_t> RegisterBudgetOccupancyWaves;
+  std::optional<uint64_t> MaxVGPRsAtTargetOccupancy;
+  std::optional<uint64_t> MaxSGPRsAtTargetOccupancy;
 };
 
 enum class DirectLDSProfitReason {
@@ -73,6 +94,8 @@ enum class DirectLDSProfitReason {
   OccupancyLossUnpriced,
   NotProfitable,
   OccupancyLossNotPaid,
+  MissingResourceProof,
+  UnenforcedOccupancyProof,
 };
 
 /// Return a stable text code for diagnostics.

@@ -386,4 +386,38 @@ TEST(DirectLDSProfitabilityTest, IsMonotonic) {
   EXPECT_EQ(evaluate(C, F).Reason, DirectLDSProfitReason::NotProfitable);
 }
 
+TEST(DirectLDSProfitabilityTest, RequiresEnforcedPreRAResourceProof) {
+  Candidate C(16);
+  auto F = baseFacts();
+  F.ResourceProofMode = DirectLDSResourceProofMode::GuaranteedPreRAOccupancy;
+  F.ClassicVGPRs = 4;
+  F.DirectVGPRs = 1;
+  F.ClassicOccupancyWaves = 8;
+  F.DirectOccupancyWaves = 8;
+  EXPECT_EQ(evaluate(C, F).Reason, DirectLDSProfitReason::MissingResourceProof);
+
+  F.RemovedExclusivePayloadDwords = 4;
+  F.AddedDivergentOffsetDwords = 1;
+  F.NetDivergentDwordDelta = -2;
+  F.TargetMaxOccupancyWaves = 8;
+  F.EffectiveOccupancyWaves = 8;
+  F.NonRegisterOccupancyWaves = 8;
+  F.RegisterBudgetOccupancyWaves = 8;
+  F.MaxVGPRsAtTargetOccupancy = 32;
+  F.MaxSGPRsAtTargetOccupancy = 102;
+  EXPECT_EQ(evaluate(C, F).Reason,
+            DirectLDSProfitReason::UnenforcedOccupancyProof);
+
+  F.RegisterBudgetOccupancyWaves.reset();
+  EXPECT_EQ(evaluate(C, F).Reason,
+            DirectLDSProfitReason::MissingResourceProof);
+  F.RegisterBudgetOccupancyWaves = 8;
+
+  F.NetDivergentDwordDelta = -3;
+  EXPECT_EQ(evaluate(C, F).Reason, DirectLDSProfitReason::Profitable);
+  F.EffectiveOccupancyWaves = 7;
+  EXPECT_EQ(evaluate(C, F).Reason,
+            DirectLDSProfitReason::UnenforcedOccupancyProof);
+}
+
 } // namespace

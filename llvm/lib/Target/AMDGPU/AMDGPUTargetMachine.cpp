@@ -730,6 +730,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeAMDGPUTarget() {
   initializeAMDGPUPromoteAllocaPass(*PR);
   initializeAMDGPUCodeGenPreparePass(*PR);
   initializeAMDGPULateCodeGenPrepareLegacyPass(*PR);
+  initializeAMDGPUAutoDirectLDSLegacyPass(*PR);
   initializeAMDGPURemoveIncompatibleFunctionsLegacyPass(*PR);
   initializeAMDGPULowerModuleLDSLegacyPass(*PR);
   initializeAMDGPULowerBufferFatPointersPass(*PR);
@@ -1743,6 +1744,7 @@ bool GCNPassConfig::addPreISel() {
   if (TM->getOptLevel() > CodeGenOptLevel::None) {
     addPass(createSinkingPass());
     addPass(createAMDGPULateCodeGenPrepareLegacyPass());
+    addPass(createAMDGPUAutoDirectLDSLegacyPass(getTM<GCNTargetMachine>()));
   }
 
   // Merge divergent exit nodes. StructurizeCFG won't recognize the multi-exit
@@ -2507,6 +2509,7 @@ void AMDGPUCodeGenPassBuilder::addPreISel(PassManagerWrapper &PMW) {
     addFunctionPass(FlattenCFGPass(), PMW);
     addFunctionPass(SinkingPass(), PMW);
     addFunctionPass(AMDGPULateCodeGenPreparePass(getTM()), PMW);
+    addFunctionPass(AMDGPUAutoDirectLDSPass(getTM()), PMW);
   }
 
   // Merge divergent exit nodes. StructurizeCFG won't recognize the multi-exit
