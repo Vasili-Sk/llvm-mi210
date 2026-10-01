@@ -300,6 +300,9 @@ extern char &SIWholeQuadModeID;
 void initializeSILowerControlFlowLegacyPass(PassRegistry &);
 extern char &SILowerControlFlowLegacyID;
 
+void initializeSILowerDirectLDSLegacyPass(PassRegistry &);
+extern char &SILowerDirectLDSLegacyID;
+
 void initializeSIPreEmitPeepholeLegacyPass(PassRegistry &);
 extern char &SIPreEmitPeepholeID;
 
@@ -482,6 +485,13 @@ class SIModeRegisterPass : public RequiredPassInfoMixin<SIModeRegisterPass> {
 public:
   SIModeRegisterPass() = default;
   PreservedAnalyses run(MachineFunction &F, MachineFunctionAnalysisManager &AM);
+};
+
+class SILowerDirectLDSPass
+    : public RequiredPassInfoMixin<SILowerDirectLDSPass> {
+public:
+  PreservedAnalyses run(MachineFunction &MF,
+                        MachineFunctionAnalysisManager &MFAM);
 };
 
 class SIMemoryLegalizerPass

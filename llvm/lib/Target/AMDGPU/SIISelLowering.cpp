@@ -13052,36 +13052,37 @@ SDValue SITargetLowering::LowerINTRINSIC_VOID(SDValue Op,
     SDValue SAddr = Op.getOperand(2);
     SDValue VOffset = Op.getOperand(3);
     SDValue LDSBase = Op.getOperand(4);
-    // The intrinsic contract promises that both bases are wave-uniform.
-    // SelectionDAG divergence analysis cannot prove this for all valid values,
-    // such as an LDS base selected by a wave index within a workgroup.
+    // A uniform value can still use a VGPR when it differs between waves in a
+    // workgroup. Preserve a scalar value on the late pseudo. Machine LICM can
+    // then hoist this read when the source is loop invariant.
+    if (LDSBase->isDivergent())
+      LDSBase = SDValue(DAG.getMachineNode(AMDGPU::V_READFIRSTLANE_B32, DL,
+                                           MVT::i32, LDSBase), 0);
 
     unsigned Opc;
     switch (Op->getConstantOperandVal(5)) {
     default:
       return Diagnose("invalid explicit global-to-LDS width");
     case 4:
-      Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORD_SADDR;
+      Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORD_SADDR_BASE;
       break;
     case 8:
-      Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX2_SADDR;
+      Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX2_SADDR_BASE;
       break;
     case 12:
-      Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX3_SADDR;
+      Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX3_SADDR_BASE;
       break;
     case 16:
-      Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX4_SADDR;
+      Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX4_SADDR_BASE;
       break;
     }
 
-    SDValue M0Val = copyToM0(DAG, Chain, DL, LDSBase);
     unsigned Aux = Op.getConstantOperandVal(6);
     SmallVector<SDValue, 7> Ops{
-        SAddr, VOffset, DAG.getTargetConstant(0, DL, MVT::i32),
+        SAddr, VOffset, LDSBase, DAG.getTargetConstant(0, DL, MVT::i32),
         DAG.getTargetConstant(Aux & ~AMDGPU::CPol::VIRTUAL_BITS, DL,
                               MVT::i32),
-        DAG.getTargetConstant(0, DL, MVT::i8), M0Val.getValue(0),
-        M0Val.getValue(1)};
+        DAG.getTargetConstant(0, DL, MVT::i8), Chain};
     auto *M = cast<MemSDNode>(Op);
     auto *Load = DAG.getMachineNode(Opc, DL, M->getVTList(), Ops);
     DAG.setNodeMemRefs(Load, M->memoperands());

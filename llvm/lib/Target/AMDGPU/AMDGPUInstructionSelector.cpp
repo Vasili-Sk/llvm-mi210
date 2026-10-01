@@ -3797,8 +3797,9 @@ bool AMDGPUInstructionSelector::selectGlobalLoadLds(MachineInstr &MI) const{
 
   MachineBasicBlock *MBB = MI.getParent();
   const DebugLoc &DL = MI.getDebugLoc();
-  BuildMI(*MBB, &MI, DL, TII.get(AMDGPU::COPY), AMDGPU::M0)
-      .add(MI.getOperand(IsExplicitBase ? 3 : 2));
+  if (!IsExplicitBase)
+    BuildMI(*MBB, &MI, DL, TII.get(AMDGPU::COPY), AMDGPU::M0)
+        .add(MI.getOperand(2));
 
   Register Addr = MI.getOperand(1).getReg();
   Register VOffset =
@@ -3831,6 +3832,24 @@ bool AMDGPUInstructionSelector::selectGlobalLoadLds(MachineInstr &MI) const{
 
   if (isSGPR(Addr)) {
     Opc = AMDGPU::getGlobalSaddrOp(Opc);
+    if (IsExplicitBase) {
+      switch (Size) {
+      case 4:
+        Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORD_SADDR_BASE;
+        break;
+      case 8:
+        Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX2_SADDR_BASE;
+        break;
+      case 12:
+        Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX3_SADDR_BASE;
+        break;
+      case 16:
+        Opc = AMDGPU::GLOBAL_LOAD_LDS_DWORDX4_SADDR_BASE;
+        break;
+      default:
+        llvm_unreachable("invalid direct LDS width");
+      }
+    }
     if (!VOffset) {
       VOffset = MRI->createVirtualRegister(&AMDGPU::VGPR_32RegClass);
       BuildMI(*MBB, &MI, DL, TII.get(AMDGPU::V_MOV_B32_e32), VOffset)
@@ -3843,6 +3862,9 @@ bool AMDGPUInstructionSelector::selectGlobalLoadLds(MachineInstr &MI) const{
 
   if (isSGPR(Addr))
     MIB.addReg(VOffset);
+
+  if (IsExplicitBase)
+    MIB.add(MI.getOperand(3));
 
   if (IsExplicitBase)
     MIB.addImm(0);

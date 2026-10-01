@@ -21,10 +21,10 @@ declare void @llvm.amdgcn.global.load.lds.base(ptr addrspace(1), i32, ptr addrsp
 ; GCN: s_endpgm
 ;
 ; MEM-LABEL: name: explicit_widths
-; MEM: GLOBAL_LOAD_LDS_DWORD_SADDR {{.*}} :: (load (s32) from %ir.base, align 1, addrspace 1), (store (s2048) into @llvm.amdgcn.kernel.explicit_widths.lds, align 1, addrspace 3)
-; MEM: GLOBAL_LOAD_LDS_DWORDX2_SADDR {{.*}} :: (load (s64) from %ir.base, align 1, addrspace 1), (store (s4096) into @llvm.amdgcn.kernel.explicit_widths.lds, align 1, addrspace 3)
-; MEM: GLOBAL_LOAD_LDS_DWORDX3_SADDR {{.*}} :: (load (s96) from %ir.base, align 1, addrspace 1), (store (s6144) into @llvm.amdgcn.kernel.explicit_widths.lds, align 1, addrspace 3)
-; MEM: GLOBAL_LOAD_LDS_DWORDX4_SADDR {{.*}} :: (load (s128) from %ir.base, align 1, addrspace 1), (store (s8192) into @llvm.amdgcn.kernel.explicit_widths.lds, align 1, addrspace 3)
+; MEM: GLOBAL_LOAD_LDS_DWORD_SADDR_BASE {{.*}} :: (load (s32) from %ir.base, align 1, addrspace 1), (store (s2048) into @llvm.amdgcn.kernel.explicit_widths.lds, align 1, addrspace 3)
+; MEM: GLOBAL_LOAD_LDS_DWORDX2_SADDR_BASE {{.*}} :: (load (s64) from %ir.base, align 1, addrspace 1), (store (s4096) into @llvm.amdgcn.kernel.explicit_widths.lds, align 1, addrspace 3)
+; MEM: GLOBAL_LOAD_LDS_DWORDX3_SADDR_BASE {{.*}} :: (load (s96) from %ir.base, align 1, addrspace 1), (store (s6144) into @llvm.amdgcn.kernel.explicit_widths.lds, align 1, addrspace 3)
+; MEM: GLOBAL_LOAD_LDS_DWORDX4_SADDR_BASE {{.*}} :: (load (s128) from %ir.base, align 1, addrspace 1), (store (s8192) into @llvm.amdgcn.kernel.explicit_widths.lds, align 1, addrspace 3)
 ; BANK-LABEL: name: explicit_widths
 ; BANK: %[[BASE:[0-9]+]]:sgpr(p1) = G_LOAD
 ; BANK: %[[LDS:[0-9]+]]:sgpr(p3) = G_CONSTANT i32 0
@@ -55,7 +55,7 @@ define amdgpu_kernel void @classic(ptr addrspace(1) %in,
 attributes #0 = { nounwind "target-cpu"="gfx90a" }
 
 ; MEM-LABEL: name: explicit_volatile
-; MEM: GLOBAL_LOAD_LDS_DWORD_SADDR {{.*}} :: (volatile load (s32) from %ir.base, align 1, addrspace 1), (volatile store (s2048) into @llvm.amdgcn.kernel.explicit_volatile.lds, align 1, addrspace 3)
+; MEM: GLOBAL_LOAD_LDS_DWORD_SADDR_BASE {{.*}} :: (volatile load (s32) from %ir.base, align 1, addrspace 1), (volatile store (s2048) into @llvm.amdgcn.kernel.explicit_volatile.lds, align 1, addrspace 3)
 define amdgpu_kernel void @explicit_volatile(ptr addrspace(1) inreg %base,
                                                i32 %lane_offset) #0 {
   call void @llvm.amdgcn.global.load.lds.base(ptr addrspace(1) %base,

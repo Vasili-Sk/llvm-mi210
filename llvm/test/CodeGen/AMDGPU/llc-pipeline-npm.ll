@@ -88,6 +88,7 @@
 ; GCN-O0-NEXT:       si-post-ra-bundler
 ; GCN-O0-NEXT:       fentry-insert
 ; GCN-O0-NEXT:       xray-instrumentation
+; GCN-O0-NEXT:       si-lower-direct-lds
 ; GCN-O0-NEXT:       si-memory-legalizer
 ; GCN-O0-NEXT:       si-insert-waitcnts
 ; GCN-O0-NEXT:       si-mode-register
@@ -272,6 +273,7 @@
 ; GCN-O2-NEXT:       fentry-insert
 ; GCN-O2-NEXT:       xray-instrumentation
 ; GCN-O2-NEXT:       gcn-create-vopd
+; GCN-O2-NEXT:       si-lower-direct-lds
 ; GCN-O2-NEXT:       si-memory-legalizer
 ; GCN-O2-NEXT:       si-post-ra-16bit-mov-folding
 ; GCN-O2-NEXT:       si-insert-waitcnts
@@ -460,6 +462,7 @@
 ; GCN-O3-NEXT:       fentry-insert
 ; GCN-O3-NEXT:       xray-instrumentation
 ; GCN-O3-NEXT:       gcn-create-vopd
+; GCN-O3-NEXT:       si-lower-direct-lds
 ; GCN-O3-NEXT:       si-memory-legalizer
 ; GCN-O3-NEXT:       si-post-ra-16bit-mov-folding
 ; GCN-O3-NEXT:       si-insert-waitcnts

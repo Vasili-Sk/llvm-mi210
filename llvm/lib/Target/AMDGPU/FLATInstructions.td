@@ -1220,6 +1220,38 @@ defm GLOBAL_LOAD_LDS_USHORT : FLAT_Global_Load_LDS_Pseudo <"global_load_lds_usho
 defm GLOBAL_LOAD_LDS_SSHORT : FLAT_Global_Load_LDS_Pseudo <"global_load_lds_sshort", 0, 1>;
 defm GLOBAL_LOAD_LDS_DWORD  : FLAT_Global_Load_LDS_Pseudo <"global_load_lds_dword", 0, 1>;
 
+// Keep the explicit gfx90a LDS base visible until late machine lowering.
+// These pseudos have the SADDR form operands followed by the uniform LDS base.
+class GFX90A_Global_Load_LDS_Base_Pseudo<string Name> : FLAT_Pseudo<
+    Name, (outs),
+    (ins SReg_64:$saddr, VGPROp_32:$vaddr, SReg_32:$ldsbase,
+         flat_offset:$offset, CPol_0:$cpol, i1imm_0:$IsAsync), ""> {
+  let SubtargetPredicate = isGFX90AOnly;
+  let mayLoad = 1;
+  let mayStore = 1;
+  let hasSideEffects = 1;
+  let isCodeGenOnly = 1;
+  let Uses = [EXEC];
+  let LGKM_CNT = 0;
+  let VM_CNT = 1;
+  let is_flat_global = 1;
+  let lds = 1;
+  let has_data = 0;
+  let has_saddr = 1;
+  let enabled_saddr = 1;
+  let VALU = 1;
+  let SchedRW = [WriteVMEM, WriteLDS];
+}
+
+def GLOBAL_LOAD_LDS_DWORD_SADDR_BASE :
+    GFX90A_Global_Load_LDS_Base_Pseudo<"global_load_lds_dword_saddr_base">;
+def GLOBAL_LOAD_LDS_DWORDX2_SADDR_BASE :
+    GFX90A_Global_Load_LDS_Base_Pseudo<"global_load_lds_dwordx2_saddr_base">;
+def GLOBAL_LOAD_LDS_DWORDX3_SADDR_BASE :
+    GFX90A_Global_Load_LDS_Base_Pseudo<"global_load_lds_dwordx3_saddr_base">;
+def GLOBAL_LOAD_LDS_DWORDX4_SADDR_BASE :
+    GFX90A_Global_Load_LDS_Base_Pseudo<"global_load_lds_dwordx4_saddr_base">;
+
 // These pre-gfx940 encodings execute on gfx90a although the published MI200
 // ISA and the upstream assembler do not expose them. gfx950 uses different,
 // dedicated x3 and x4 opcodes. There is no corresponding gfx950 x2 opcode.

@@ -171,6 +171,7 @@ add_llvm_target(AMDGPUCodeGen
   SILateBranchLowering.cpp
   SILoadStoreOptimizer.cpp
   SILowerControlFlow.cpp
+  SILowerDirectLDS.cpp
   SILowerI1Copies.cpp
   SILowerWWMCopies.cpp
   SILowerSGPRSpills.cpp
