@@ -52,6 +52,10 @@ static cl::opt<bool> DirectLDSDiagnostic(
     "amdgpu-direct-lds-cfg-v2-diagnostic", cl::Hidden, cl::init(false),
     cl::desc("Report diagnostic-only multi-wave direct LDS candidates"));
 
+static cl::opt<bool> DirectLDSCFGV2Atomic(
+    "amdgpu-direct-lds-cfg-v2-atomic", cl::Hidden, cl::init(false),
+    cl::desc("Enable experimental atomic cfg_v2 direct LDS lowering"));
+
 namespace {
 
 class AMDGPUAutoDirectLDSLegacy : public FunctionPass {
@@ -237,9 +241,10 @@ static LoadInst *getX4Producer(Value *V, unsigned &Payload) {
   return LI;
 }
 
-static void printCFGV2Report(Function &F, ScalarEvolution &SE,
-                             UniformityInfo &UI, DominatorTree &DT,
-                             PostDominatorTree &PDT) {
+static bool analyzeCFGV2(Function &F, ScalarEvolution &SE,
+                         UniformityInfo &UI, DominatorTree &DT,
+                         PostDominatorTree &PDT, bool EmitReport,
+                         SmallVectorImpl<LoadInst *> *AtomicProducers = nullptr) {
   (void)SE;
   const DataLayout &DL = F.getDataLayout();
   StringRef Target = F.getFnAttribute("target-cpu").getValueAsString();
@@ -735,6 +740,7 @@ static void printCFGV2Report(Function &F, ScalarEvolution &SE,
   bool WaitHazardProof = ProducerSSAWaitProof && BarrierOrderProof &&
                          FenceProof && OverwriteProof && CFGProof;
   bool Candidate = Reasons.empty();
+  if (EmitReport) {
   errs() << "AMDGPU-DIRECT-LDS-CFG-V2 {\"function\":\"" << F.getName()
          << "\",\"status\":\"" << (Candidate ? "matched" : "rejected")
          << "\",\"target\":\"" << Target << "\",\"workgroup\":" << Workgroup
@@ -798,6 +804,100 @@ static void printCFGV2Report(Function &F, ScalarEvolution &SE,
     errs() << '\"' << Reasons[I] << '\"';
   }
   errs() << "]}\n";
+  }
+  if (Candidate && AtomicProducers)
+    AtomicProducers->append(Producers.begin(), Producers.end());
+  return Candidate;
+}
+
+// The atomic path must reject before it builds IR when either the 32-bit
+// source offset or the final-register occupancy contract is absent. The
+// current cfg_v2 fixture intentionally reaches this gate with wrapping i32
+// stage arithmetic and no waves-per-EU contract.
+static bool validateCFGV2AtomicPrerequisites(Function &F, ScalarEvolution &SE,
+                                             UniformityInfo &UI,
+                                             const GCNSubtarget &ST,
+                                             ArrayRef<LoadInst *> Producers) {
+  const DataLayout &DL = F.getDataLayout();
+  StringRef Reason;
+  for (LoadInst *P : Producers) {
+    Value *Base = getUnderlyingObject(P->getPointerOperand());
+    if (!Base || !Base->getType()->isPointerTy() ||
+        cast<PointerType>(Base->getType())->getAddressSpace() != 1 ||
+        !UI.isUniformAtDef(Base)) {
+      Reason = "missing-uniform-global-base";
+      break;
+    }
+    const SCEV *Offset =
+        SE.getMinusSCEV(SE.getSCEV(P->getPointerOperand()), SE.getSCEV(Base));
+    if (isa<SCEVCouldNotCompute>(Offset) || !Offset->getType()->isIntegerTy()) {
+      Reason = "unknown-global-offset";
+      break;
+    }
+    ConstantRange Range = SE.getUnsignedRange(Offset);
+    APInt MaxStart(Range.getBitWidth(), UINT32_MAX - 15ULL);
+    if (Range.isWrappedSet() || Range.getUnsignedMax().ugt(MaxStart)) {
+      Reason = "unproved-i32-global-offset-range";
+      break;
+    }
+  }
+
+  const bool OffsetProof = Reason.empty();
+  StringRef ResourceReason;
+  Attribute Waves = F.getFnAttribute("amdgpu-waves-per-eu");
+  if (!Waves.isStringAttribute())
+    ResourceReason = "missing-exact-occupancy-contract";
+  if (ResourceReason.empty()) {
+    auto Requested = AMDGPU::getIntegerPairAttribute(
+        F, "amdgpu-waves-per-eu", {0, 0}, /*OnlyFirstRequired=*/false);
+    if (!Requested.first || Requested.first != Requested.second) {
+      ResourceReason = "missing-exact-occupancy-contract";
+    } else {
+      uint64_t StaticLDSBytes = 0;
+      SmallPtrSet<GlobalVariable *, 4> Seen;
+      for (Instruction &I : instructions(F))
+        for (Value *Op : I.operands())
+          if (Op->getType()->isPointerTy())
+            if (auto *GV = dyn_cast<GlobalVariable>(getUnderlyingObject(Op)))
+              if (GV->getAddressSpace() == 3 && Seen.insert(GV).second) {
+                TypeSize Size = DL.getTypeAllocSize(GV->getValueType());
+                if (Size.isScalable()) {
+                  ResourceReason = "unknown-static-lds";
+                  break;
+                }
+                StaticLDSBytes =
+                    alignTo(StaticLDSBytes, GV->getAlign().valueOrOne());
+                StaticLDSBytes += Size.getFixedValue();
+              }
+      auto Groups = ST.getFlatWorkGroupSizes(F);
+      auto NonRegister =
+          ST.getOccupancyWithWorkGroupSizes(StaticLDSBytes, Groups);
+      auto Effective =
+          ST.getEffectiveWavesPerEU(Requested, Groups, StaticLDSBytes);
+      if (ResourceReason.empty() &&
+          (Effective != Requested || NonRegister.second < Requested.second))
+        ResourceReason = "unproved-nonregister-occupancy";
+      if (ResourceReason.empty()) {
+        unsigned MaxVGPR = ST.getMaxNumVGPRs(F);
+        unsigned MaxSGPR = ST.getMaxNumSGPRs(F);
+        auto Budget = ST.computeOccupancy(F, StaticLDSBytes, MaxSGPR, MaxVGPR);
+        if (Budget.second < Requested.second)
+          ResourceReason = "unproved-register-budget";
+      }
+    }
+  }
+
+  const bool ResourceProof = ResourceReason.empty();
+  if (Reason.empty())
+    Reason =
+        ResourceReason.empty() ? "atomic-plan-not-implemented" : ResourceReason;
+  errs() << "AMDGPU-DIRECT-LDS-CFG-V2-ATOMIC {\"function\":\"" << F.getName()
+         << "\",\"status\":\"rejected\",\"reason\":\"" << Reason
+         << "\",\"offset_proof\":" << (OffsetProof ? "true" : "false")
+         << ",\"resource_proof\":" << (ResourceProof ? "true" : "false")
+         << ",\"resource_reason\":\"" << ResourceReason
+         << "\",\"ir_changed\":false}\n";
+  return false;
 }
 
 static bool isAllowedCall(const CallBase &CB) {
@@ -1250,10 +1350,16 @@ bool AMDGPUAutoDirectLDSLegacy::runOnFunction(Function &F) {
   ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
   UniformityInfo &UI =
       getAnalysis<UniformityInfoWrapperPass>().getUniformityInfo();
-  if (DirectLDSDiagnostic) {
+  if (DirectLDSDiagnostic || DirectLDSCFGV2Atomic) {
     DominatorTree DT(F);
     PostDominatorTree PDT(F);
-    printCFGV2Report(F, SE, UI, DT, PDT);
+    SmallVector<LoadInst *, 24> AtomicProducers;
+    bool Matched = analyzeCFGV2(F, SE, UI, DT, PDT, DirectLDSDiagnostic,
+                                &AtomicProducers);
+    if (DirectLDSCFGV2Atomic && Matched && hasWellFormedWavesPerEUSyntax(F))
+      validateCFGV2AtomicPrerequisites(
+          F, SE, UI, *static_cast<const GCNSubtarget *>(TM.getSubtargetImpl(F)),
+          AtomicProducers);
   }
   if (!hasWellFormedWavesPerEUSyntax(F))
     return false;
@@ -1267,9 +1373,17 @@ PreservedAnalyses AMDGPUAutoDirectLDSPass::run(Function &F,
   LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
   ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
   UniformityInfo &UI = FAM.getResult<UniformityInfoAnalysis>(F);
-  if (DirectLDSDiagnostic)
-    printCFGV2Report(F, SE, UI, FAM.getResult<DominatorTreeAnalysis>(F),
-                     FAM.getResult<PostDominatorTreeAnalysis>(F));
+  if (DirectLDSDiagnostic || DirectLDSCFGV2Atomic) {
+    SmallVector<LoadInst *, 24> AtomicProducers;
+    bool Matched = analyzeCFGV2(
+        F, SE, UI, FAM.getResult<DominatorTreeAnalysis>(F),
+        FAM.getResult<PostDominatorTreeAnalysis>(F), DirectLDSDiagnostic,
+        &AtomicProducers);
+    if (DirectLDSCFGV2Atomic && Matched && hasWellFormedWavesPerEUSyntax(F))
+      validateCFGV2AtomicPrerequisites(
+          F, SE, UI, *static_cast<const GCNSubtarget *>(TM.getSubtargetImpl(F)),
+          AtomicProducers);
+  }
   if (!hasWellFormedWavesPerEUSyntax(F))
     return PreservedAnalyses::all();
   if (!runAutoDirectLDS(
