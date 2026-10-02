@@ -17,6 +17,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/UniformityAnalysis.h"
@@ -25,6 +26,7 @@
 #include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/IRBuilder.h"
@@ -37,6 +39,7 @@
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
 using namespace llvm;
@@ -44,6 +47,10 @@ using namespace llvm::AMDGPU;
 using namespace llvm::PatternMatch;
 
 #define DEBUG_TYPE "amdgpu-auto-direct-lds"
+
+static cl::opt<bool> DirectLDSDiagnostic(
+    "amdgpu-direct-lds-cfg-v2-diagnostic", cl::Hidden, cl::init(false),
+    cl::desc("Report diagnostic-only multi-wave direct LDS candidates"));
 
 namespace {
 
@@ -76,7 +83,11 @@ struct Candidate {
   Loop *CandidateLoop = nullptr;
 };
 
-static std::optional<int64_t> evalInt(Value *V, unsigned Lane) {
+static std::optional<int64_t> evalInt(Value *V, unsigned Lane,
+                                      Value *Scalar = nullptr,
+                                      int64_t ScalarValue = 0) {
+  if (V == Scalar)
+    return ScalarValue;
   if (auto *C = dyn_cast<ConstantInt>(V))
     return C->getSExtValue();
   if (auto *II = dyn_cast<IntrinsicInst>(V)) {
@@ -88,15 +99,15 @@ static std::optional<int64_t> evalInt(Value *V, unsigned Lane) {
   if (!I)
     return std::nullopt;
   if (auto *Cast = dyn_cast<CastInst>(I)) {
-    auto X = evalInt(Cast->getOperand(0), Lane);
+    auto X = evalInt(Cast->getOperand(0), Lane, Scalar, ScalarValue);
     if (!X)
       return std::nullopt;
     unsigned Bits = Cast->getType()->getIntegerBitWidth();
     return APInt(Bits, *X, true).getSExtValue();
   }
   if (auto *BO = dyn_cast<BinaryOperator>(I)) {
-    auto A = evalInt(BO->getOperand(0), Lane);
-    auto B = evalInt(BO->getOperand(1), Lane);
+    auto A = evalInt(BO->getOperand(0), Lane, Scalar, ScalarValue);
+    auto B = evalInt(BO->getOperand(1), Lane, Scalar, ScalarValue);
     if (!A || !B)
       return std::nullopt;
     switch (BO->getOpcode()) {
@@ -121,16 +132,18 @@ static std::optional<int64_t> evalInt(Value *V, unsigned Lane) {
   return std::nullopt;
 }
 
-static std::optional<int64_t> evalPointerOffset(Value *Ptr,
-                                                const GlobalVariable *Base,
+static std::optional<int64_t> evalPointerOffset(Value *Ptr, const Value *Base,
                                                 unsigned Lane,
-                                                const DataLayout &DL) {
+                                                const DataLayout &DL,
+                                                Value *Scalar = nullptr,
+                                                int64_t ScalarValue = 0) {
   if (Ptr == Base)
     return 0;
   auto *GEP = dyn_cast<GetElementPtrInst>(Ptr);
   if (!GEP)
     return std::nullopt;
-  auto Result = evalPointerOffset(GEP->getPointerOperand(), Base, Lane, DL);
+  auto Result = evalPointerOffset(GEP->getPointerOperand(), Base, Lane, DL,
+                                  Scalar, ScalarValue);
   if (!Result)
     return std::nullopt;
   auto GTI = gep_type_begin(GEP);
@@ -141,7 +154,7 @@ static std::optional<int64_t> evalPointerOffset(Value *Ptr,
         return std::nullopt;
       *Result += DL.getStructLayout(ST)->getElementOffset(CI->getZExtValue());
     } else {
-      auto N = evalInt(Index, Lane);
+      auto N = evalInt(Index, Lane, Scalar, ScalarValue);
       if (!N)
         return std::nullopt;
       TypeSize Size = DL.getTypeAllocSize(GTI.getIndexedType());
@@ -152,6 +165,639 @@ static std::optional<int64_t> evalPointerOffset(Value *Ptr,
     ++GTI;
   }
   return Result;
+}
+
+struct CFGV2Access {
+  Instruction *I = nullptr;
+  int64_t RegionBase = 0;
+  unsigned Group = 0;
+  unsigned Payload = 0;
+};
+
+// Derive the base of one four-wave producer region from the access expression.
+// The target layout supplies only the lane and payload placement. No absolute
+// LDS coordinate is part of this proof.
+static bool deriveCFGV2Address(Value *Ptr, const GlobalVariable *LDS,
+                               const DataLayout &DL,
+                               const DirectLDSLayout &Layout,
+                               unsigned WaveCount, int64_t &RegionBase,
+                               unsigned &Payload, int64_t &MinOffset,
+                               int64_t &MaxOffset, int ExpectedPayload = -1) {
+  const uint64_t WaveRegionBytes = Layout.getFootprintBytes();
+  for (unsigned P = 0; P != Layout.getPayloadWords(); ++P) {
+    if (ExpectedPayload >= 0 && P != unsigned(ExpectedPayload))
+      continue;
+    std::optional<int64_t> Base;
+    int64_t Min = INT64_MAX, Max = INT64_MIN;
+    bool Match = true;
+    for (unsigned TID = 0; TID != WaveCount * Layout.getWaveSize(); ++TID) {
+      auto Actual = evalPointerOffset(Ptr, LDS, TID, DL);
+      auto Direct = Layout.getByteOffset(TID % Layout.getWaveSize(), P);
+      if (!Actual || !Direct) {
+        Match = false;
+        break;
+      }
+      int64_t ThisBase =
+          *Actual -
+          int64_t(TID / Layout.getWaveSize()) * int64_t(WaveRegionBytes) -
+          int64_t(*Direct);
+      if (Base && *Base != ThisBase) {
+        Match = false;
+        break;
+      }
+      Base = ThisBase;
+      Min = std::min(Min, *Actual);
+      Max = std::max(Max, *Actual);
+    }
+    if (Match && Base) {
+      RegionBase = *Base;
+      Payload = P;
+      MinOffset = Min;
+      MaxOffset = Max;
+      return true;
+    }
+  }
+  return false;
+}
+
+static LoadInst *getX4Producer(Value *V, unsigned &Payload) {
+  auto *EE = dyn_cast<ExtractElementInst>(V);
+  if (!EE)
+    return nullptr;
+  auto *Index = dyn_cast<ConstantInt>(EE->getIndexOperand());
+  auto *LI = dyn_cast<LoadInst>(EE->getVectorOperand());
+  if (!Index || !LI || Index->getZExtValue() >= 4)
+    return nullptr;
+  auto *VT = dyn_cast<FixedVectorType>(LI->getType());
+  if (!VT || VT->getNumElements() != 4 ||
+      !VT->getElementType()->isIntegerTy(32) ||
+      LI->getPointerAddressSpace() != 1)
+    return nullptr;
+  Payload = Index->getZExtValue();
+  return LI;
+}
+
+static void printCFGV2Report(Function &F, ScalarEvolution &SE,
+                             UniformityInfo &UI, DominatorTree &DT,
+                             PostDominatorTree &PDT) {
+  (void)SE;
+  const DataLayout &DL = F.getDataLayout();
+  StringRef Target = F.getFnAttribute("target-cpu").getValueAsString();
+  constexpr unsigned WaveSize = 64;
+  auto Layout = DirectLDSLayout::create(Target, WaveSize, 16);
+  const auto WorkgroupRange = AMDGPU::getIntegerPairAttribute(
+      F, "amdgpu-flat-work-group-size", {0, 0}, true);
+  const unsigned Workgroup = WorkgroupRange.second;
+  const unsigned WaveCount =
+      Workgroup && Workgroup % WaveSize == 0 ? Workgroup / WaveSize : 0;
+  const unsigned X4Width = Layout ? Layout->getWidthBytes() : 0;
+  const unsigned PayloadCount = Layout ? Layout->getPayloadWords() : 0;
+  const unsigned RegionSize = Layout ? Layout->getFootprintBytes() : 0;
+  const uint64_t GroupSpan = uint64_t(WaveCount) * RegionSize;
+
+  SmallVector<LoadInst *, 24> Producers;
+  SmallVector<CFGV2Access, 96> Stores;
+  SmallVector<CFGV2Access, 96> Consumers;
+  SmallVector<Instruction *, 8> Barriers;
+  SmallVector<Instruction *, 256> Ordered;
+  SmallVector<std::string, 8> Reasons;
+  DenseMap<const Instruction *, unsigned> Ordinal;
+  GlobalVariable *LDS = nullptr;
+  unsigned ExtraProducers = 0, ExtraStores = 0, ExtraConsumers = 0;
+  unsigned ExtraReads = 0, Aliases = 0, Escapes = 0, UnsupportedFlags = 0;
+  bool DivergentBase = false, MalformedCFG = false;
+  bool InBounds = true;
+
+  auto AddLDSAccess = [&](Instruction &I, Value *Ptr, bool IsStore) {
+    auto *GV = dyn_cast<GlobalVariable>(getUnderlyingObject(Ptr));
+    if (!GV) {
+      ++Aliases;
+      return;
+    }
+    if (!LDS)
+      LDS = GV;
+    if (GV != LDS) {
+      ++Aliases;
+      return;
+    }
+    if (!IsStore) {
+      Consumers.push_back({&I, 0, 0, 0});
+      return;
+    }
+    unsigned SourcePayload;
+    LoadInst *Producer =
+        getX4Producer(cast<StoreInst>(&I)->getValueOperand(), SourcePayload);
+    int64_t Base, Min, Max;
+    unsigned Payload;
+    if (!Producer || !Layout || WaveCount != 4 ||
+        !deriveCFGV2Address(Ptr, LDS, DL, *Layout, WaveCount, Base, Payload,
+                            Min, Max, SourcePayload)) {
+      ++ExtraStores;
+      return;
+    }
+    TypeSize ObjectSize = DL.getTypeAllocSize(LDS->getValueType());
+    if (ObjectSize.isScalable() || Min < 0 ||
+        uint64_t(Max) + 4 > ObjectSize.getFixedValue())
+      InBounds = false;
+    Stores.push_back({&I, Base, 0, Payload});
+  };
+
+  for (Instruction &I : instructions(F)) {
+    Ordinal[&I] = Ordered.size();
+    Ordered.push_back(&I);
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      if (II->getIntrinsicID() == Intrinsic::amdgcn_s_barrier) {
+        Barriers.push_back(&I);
+        continue;
+      }
+    if (auto *LI = dyn_cast<LoadInst>(&I)) {
+      if (LI->isVolatile() || LI->isAtomic() ||
+          LI->getMetadata(LLVMContext::MD_nontemporal))
+        ++UnsupportedFlags;
+      if (auto *VT = dyn_cast<FixedVectorType>(LI->getType());
+          VT && VT->getNumElements() == 4 &&
+          VT->getElementType()->isIntegerTy(32) &&
+          LI->getPointerAddressSpace() == 1) {
+        Producers.push_back(LI);
+        Value *Base = getUnderlyingObject(LI->getPointerOperand());
+        if (UI.isDivergentAtDef(Base))
+          DivergentBase = true;
+        continue;
+      }
+      if (LI->getPointerAddressSpace() == 3) {
+        AddLDSAccess(I, LI->getPointerOperand(), false);
+        continue;
+      }
+      // Kernel argument loads are ABI materialization, not candidate memory.
+      if (LI->getPointerAddressSpace() != 4 && LI->mayReadFromMemory())
+        ++ExtraReads;
+    }
+    if (auto *SI = dyn_cast<StoreInst>(&I)) {
+      if (SI->isVolatile() || SI->isAtomic() ||
+          SI->getMetadata(LLVMContext::MD_nontemporal))
+        ++UnsupportedFlags;
+      if (SI->getPointerAddressSpace() == 3)
+        AddLDSAccess(I, SI->getPointerOperand(), true);
+    }
+  }
+
+  if (LDS) {
+    SmallVector<Value *, 32> Worklist{LDS};
+    SmallPtrSet<Value *, 32> Seen;
+    while (!Worklist.empty()) {
+      Value *V = Worklist.pop_back_val();
+      if (!Seen.insert(V).second)
+        continue;
+      for (User *U : V->users()) {
+        if (isa<GetElementPtrInst>(U) || isa<BitCastInst>(U) ||
+            isa<AddrSpaceCastInst>(U) || isa<ConstantExpr>(U)) {
+          Worklist.push_back(cast<Value>(U));
+          continue;
+        }
+        if (auto *LI = dyn_cast<LoadInst>(U))
+          if (LI->getPointerOperand() == V)
+            continue;
+        if (auto *SI = dyn_cast<StoreInst>(U))
+          if (SI->getPointerOperand() == V)
+            continue;
+        ++Escapes;
+      }
+    }
+  }
+
+  SmallVector<int64_t, 8> StoreBases, ConsumerBases;
+  for (const CFGV2Access &A : Stores)
+    StoreBases.push_back(A.RegionBase);
+  auto Unique = [](SmallVectorImpl<int64_t> &V) {
+    llvm::sort(V);
+    V.erase(std::unique(V.begin(), V.end()), V.end());
+  };
+  Unique(StoreBases);
+  SmallVector<CFGV2Access, 96> MatchedConsumers;
+  for (CFGV2Access &A : Consumers) {
+    bool Found = false;
+    for (unsigned P = 0; Layout && P != PayloadCount; ++P) {
+      int64_t Base, Min, Max;
+      unsigned Payload;
+      if (!deriveCFGV2Address(cast<LoadInst>(A.I)->getPointerOperand(), LDS, DL,
+                              *Layout, WaveCount, Base, Payload, Min, Max, P) ||
+          !llvm::is_contained(StoreBases, Base))
+        continue;
+      if (Found) {
+        Found = false;
+        break;
+      }
+      Found = true;
+      A.RegionBase = Base;
+      A.Payload = Payload;
+      TypeSize ObjectSize = DL.getTypeAllocSize(LDS->getValueType());
+      if (ObjectSize.isScalable() || Min < 0 ||
+          uint64_t(Max) + 4 > ObjectSize.getFixedValue())
+        InBounds = false;
+    }
+    if (!Found)
+      ++ExtraConsumers;
+    else {
+      ConsumerBases.push_back(A.RegionBase);
+      MatchedConsumers.push_back(A);
+    }
+  }
+  Consumers = std::move(MatchedConsumers);
+  Unique(ConsumerBases);
+  const bool EqualRegionBases = StoreBases == ConsumerBases;
+  SmallVector<int64_t, 8> RegionBases = StoreBases;
+  const unsigned GroupsPerStage = RegionBases.size();
+  const int64_t BaseDisplacement =
+      RegionBases.empty() ? 0 : RegionBases.front();
+  bool RegionProof = EqualRegionBases && !RegionBases.empty() &&
+                     (BaseDisplacement & 3) == 0 && GroupSpan != 0 && InBounds;
+  for (unsigned G = 0; G != RegionBases.size(); ++G)
+    RegionProof &=
+        RegionBases[G] == BaseDisplacement + int64_t(uint64_t(G) * GroupSpan);
+  auto AssignGroup = [&](CFGV2Access &A) {
+    auto It = llvm::lower_bound(RegionBases, A.RegionBase);
+    if (It == RegionBases.end() || *It != A.RegionBase) {
+      RegionProof = false;
+      return;
+    }
+    A.Group = It - RegionBases.begin();
+  };
+  for (CFGV2Access &A : Stores)
+    AssignGroup(A);
+  for (CFGV2Access &A : Consumers)
+    AssignGroup(A);
+
+  const unsigned AccessesPerStage = GroupsPerStage * PayloadCount;
+  const unsigned StoreStageCount =
+      AccessesPerStage && Stores.size() % AccessesPerStage == 0
+          ? Stores.size() / AccessesPerStage
+          : 0;
+  const unsigned ConsumerStageCount =
+      AccessesPerStage && Consumers.size() % AccessesPerStage == 0
+          ? Consumers.size() / AccessesPerStage
+          : 0;
+  const unsigned StageCount =
+      StoreStageCount == ConsumerStageCount ? StoreStageCount : 0;
+  const uint64_t MappingWords =
+      uint64_t(GroupsPerStage) * WaveCount * WaveSize * PayloadCount;
+
+  if (!LDS)
+    Reasons.push_back("missing-lds-base");
+  if (Target != "gfx90a")
+    Reasons.push_back("target-not-gfx90a");
+  StringRef Features = F.getFnAttribute("target-features").getValueAsString();
+  if (Features.contains("+wavefrontsize32"))
+    Reasons.push_back("wave-not-64");
+  if (Workgroup != 256 || WaveCount != 4)
+    Reasons.push_back("workgroup-not-256");
+  if (Producers.size() != 24)
+    Reasons.push_back("producer-count");
+  if (GroupsPerStage != 6 || StageCount != 4)
+    Reasons.push_back("stage-or-group-count");
+  if (Stores.size() != StageCount * AccessesPerStage)
+    Reasons.push_back("store-count");
+  if (Consumers.size() != StageCount * AccessesPerStage)
+    Reasons.push_back("consumer-count");
+  if (Barriers.size() != StageCount * 2)
+    Reasons.push_back("barrier-count");
+  if (DivergentBase)
+    Reasons.push_back("divergent-base");
+  if (Aliases || Escapes)
+    Reasons.push_back("alias-or-escape");
+  if (ExtraProducers || ExtraStores || ExtraConsumers || ExtraReads)
+    Reasons.push_back("extra-memory-access");
+  if (UnsupportedFlags)
+    Reasons.push_back("unsupported-memory-flags");
+  if (!RegionProof)
+    Reasons.push_back("region-base-mismatch");
+
+  DenseMap<LoadInst *, SmallVector<CFGV2Access, 4>> ProducerStores;
+  for (CFGV2Access A : Stores) {
+    unsigned P;
+    LoadInst *Producer =
+        getX4Producer(cast<StoreInst>(A.I)->getValueOperand(), P);
+    if (!Producer || P != A.Payload) {
+      ++ExtraStores;
+      continue;
+    }
+    ProducerStores[Producer].push_back(A);
+  }
+  bool ProducerComplete = Producers.size() == 24;
+  for (LoadInst *P : Producers) {
+    auto It = ProducerStores.find(P);
+    if (It == ProducerStores.end() || It->second.size() != PayloadCount) {
+      ProducerComplete = false;
+      ++ExtraProducers;
+      continue;
+    }
+    BitVector Seen(PayloadCount);
+    unsigned G = It->second.front().Group;
+    for (const CFGV2Access &A : It->second) {
+      if (A.Group != G || A.Payload >= PayloadCount || Seen.test(A.Payload))
+        ProducerComplete = false;
+      else
+        Seen.set(A.Payload);
+    }
+    ProducerComplete &= Seen.count() == PayloadCount;
+  }
+  if (!ProducerComplete)
+    Reasons.push_back("incomplete-producer-store");
+
+  llvm::sort(Stores, [&](const CFGV2Access &A, const CFGV2Access &B) {
+    return Ordinal[A.I] < Ordinal[B.I];
+  });
+  llvm::sort(Consumers, [&](const CFGV2Access &A, const CFGV2Access &B) {
+    return Ordinal[A.I] < Ordinal[B.I];
+  });
+
+  bool MappingProof = Layout && ProducerComplete && RegionProof &&
+                      GroupsPerStage == 6 && StageCount == 4;
+  bool ConsumerComplete = Consumers.size() == StageCount * AccessesPerStage;
+  bool BarrierOrderProof = Barriers.size() == StageCount * 2;
+  bool FenceProof = BarrierOrderProof;
+  bool OverwriteProof = BarrierOrderProof;
+  bool CFGProof = F.size() == 1;
+  bool ProducerSSAWaitProof = ProducerComplete;
+  SmallVector<std::pair<unsigned, unsigned>, 4> LoadPublish;
+  SmallVector<std::pair<unsigned, unsigned>, 4> PublishConsume;
+  SmallVector<unsigned, 4> StageFirstLoad(StageCount, UINT_MAX);
+  SmallVector<unsigned, 4> StageLastStore(StageCount, 0);
+
+  const SyncScope::ID WorkgroupScope =
+      F.getContext().getOrInsertSyncScopeID("workgroup");
+  auto HasRelease = [&](Instruction *Barrier) {
+    auto *FI = dyn_cast_or_null<FenceInst>(Barrier->getPrevNode());
+    return FI && FI->getSyncScopeID() == WorkgroupScope &&
+           (FI->getOrdering() == AtomicOrdering::Release ||
+            FI->getOrdering() == AtomicOrdering::AcquireRelease ||
+            FI->getOrdering() == AtomicOrdering::SequentiallyConsistent);
+  };
+  auto HasAcquire = [&](Instruction *Barrier) {
+    auto *FI = dyn_cast_or_null<FenceInst>(Barrier->getNextNode());
+    return FI && FI->getSyncScopeID() == WorkgroupScope &&
+           (FI->getOrdering() == AtomicOrdering::Acquire ||
+            FI->getOrdering() == AtomicOrdering::AcquireRelease ||
+            FI->getOrdering() == AtomicOrdering::SequentiallyConsistent);
+  };
+  for (Instruction *Barrier : Barriers)
+    FenceProof &= HasRelease(Barrier) && HasAcquire(Barrier);
+
+  for (unsigned Stage = 0;
+       Stage != StageCount && Stores.size() >= (Stage + 1) * AccessesPerStage &&
+       Consumers.size() >= (Stage + 1) * AccessesPerStage;
+       ++Stage) {
+    ArrayRef<CFGV2Access> SS(Stores.data() + Stage * AccessesPerStage,
+                             AccessesPerStage);
+    ArrayRef<CFGV2Access> CC(Consumers.data() + Stage * AccessesPerStage,
+                             AccessesPerStage);
+    BitVector StoreKeys(AccessesPerStage), ConsumerKeys(AccessesPerStage);
+    unsigned MinLoad = UINT_MAX, MaxLoad = 0, MinStore = UINT_MAX, MaxStore = 0;
+    unsigned MinConsumer = UINT_MAX, MaxConsumer = 0;
+    for (const CFGV2Access &A : SS) {
+      unsigned Key = A.Group * PayloadCount + A.Payload;
+      if (Key >= AccessesPerStage || StoreKeys.test(Key))
+        MappingProof = false;
+      else
+        StoreKeys.set(Key);
+      unsigned P;
+      LoadInst *Prod =
+          getX4Producer(cast<StoreInst>(A.I)->getValueOperand(), P);
+      if (!Prod) {
+        MappingProof = false;
+        ProducerSSAWaitProof = false;
+        continue;
+      }
+      MinLoad = std::min(MinLoad, Ordinal[Prod]);
+      MaxLoad = std::max(MaxLoad, Ordinal[Prod]);
+      MinStore = std::min(MinStore, Ordinal[A.I]);
+      MaxStore = std::max(MaxStore, Ordinal[A.I]);
+      if (!DT.dominates(Prod, A.I)) {
+        CFGProof = false;
+        ProducerSSAWaitProof = false;
+      }
+    }
+    for (const CFGV2Access &A : CC) {
+      unsigned Key = A.Group * PayloadCount + A.Payload;
+      if (Key >= AccessesPerStage || ConsumerKeys.test(Key))
+        ConsumerComplete = false;
+      else
+        ConsumerKeys.set(Key);
+      MinConsumer = std::min(MinConsumer, Ordinal[A.I]);
+      MaxConsumer = std::max(MaxConsumer, Ordinal[A.I]);
+    }
+    if (StoreKeys.count() != AccessesPerStage ||
+        ConsumerKeys.count() != AccessesPerStage) {
+      MappingProof = false;
+      ConsumerComplete = false;
+    }
+    if (BarrierOrderProof) {
+      Instruction *PublishBarrier = Barriers[Stage * 2];
+      Instruction *ConsumeBarrier = Barriers[Stage * 2 + 1];
+      if (!(MaxStore < Ordinal[PublishBarrier] &&
+            Ordinal[PublishBarrier] < MinConsumer &&
+            MaxConsumer < Ordinal[ConsumeBarrier]))
+        BarrierOrderProof = false;
+      for (const CFGV2Access &A : SS)
+        if (!DT.dominates(A.I, PublishBarrier))
+          CFGProof = false;
+      for (const CFGV2Access &A : CC)
+        if (!PDT.dominates(ConsumeBarrier->getParent(), A.I->getParent()))
+          CFGProof = false;
+      if (Stage + 1 < StageCount &&
+          !(Ordinal[ConsumeBarrier] <
+            Ordinal[Stores[(Stage + 1) * AccessesPerStage].I]))
+        OverwriteProof = false;
+    }
+    StageFirstLoad[Stage] = MinLoad;
+    StageLastStore[Stage] = MaxStore;
+    LoadPublish.push_back({MinStore - MinLoad, MaxStore - MaxLoad});
+    PublishConsume.push_back({MinConsumer - MaxStore, MaxConsumer - MinStore});
+
+    SmallVector<DirectLDSWord, 256> ProducerWords, ConsumerWords;
+    for (unsigned G = 0; G != GroupsPerStage; ++G) {
+      ProducerWords.clear();
+      ConsumerWords.clear();
+      for (unsigned Lane = 0; Lane != WaveSize; ++Lane)
+        for (unsigned P = 0; P != PayloadCount; ++P) {
+          uint64_t O = *Layout->getByteOffset(Lane, P);
+          ProducerWords.push_back({Lane, P, O});
+          ConsumerWords.push_back({Lane, P, O});
+        }
+      DirectLDSLayoutProof Proof{ProducerWords, ConsumerWords, RegionSize,
+                                 false, false};
+      if (matchDirectLDSLayout(*Layout, Proof) != DirectLDSLayoutMatch::Match)
+        MappingProof = false;
+    }
+  }
+
+  if (!ConsumerComplete)
+    Reasons.push_back("incomplete-or-duplicate-consumer");
+  if (!MappingProof)
+    Reasons.push_back("layout-or-inverse-mismatch");
+  if (!CFGProof) {
+    Reasons.push_back("control-flow-gap");
+    MalformedCFG = true;
+  }
+  if (!BarrierOrderProof)
+    Reasons.push_back("incomplete-barrier-order");
+  if (!FenceProof)
+    Reasons.push_back("workgroup-fence-order");
+  if (!OverwriteProof)
+    Reasons.push_back("early-overwrite");
+
+  bool QueueOrderProof = ProducerComplete && StageCount == 4;
+  Value *StageStride = nullptr;
+  for (Argument &A : F.args())
+    if (A.getType()->isIntegerTy()) {
+      if (StageStride)
+        StageStride = nullptr;
+      else
+        StageStride = &A;
+    }
+  Value *KernargScalar = nullptr;
+  bool MultipleKernargScalars = false;
+  for (Instruction &I : instructions(F))
+    if (auto *LI = dyn_cast<LoadInst>(&I))
+      if (LI->getType()->isIntegerTy(32) && LI->getPointerAddressSpace() == 4) {
+        if (KernargScalar)
+          MultipleKernargScalars = true;
+        KernargScalar = LI;
+      }
+  if (KernargScalar && !MultipleKernargScalars)
+    StageStride = KernargScalar;
+  DenseMap<LoadInst *, unsigned> ProducerStage;
+  SmallVector<unsigned, 4> StageCounts(StageCount, 0);
+  if (!StageStride)
+    QueueOrderProof = false;
+  if (QueueOrderProof) {
+    for (LoadInst *P : Producers) {
+      Value *Base = getUnderlyingObject(P->getPointerOperand());
+      auto O0 = evalPointerOffset(P->getPointerOperand(), Base, 0, DL,
+                                  StageStride, 0);
+      auto O1 = evalPointerOffset(P->getPointerOperand(), Base, 0, DL,
+                                  StageStride, 1);
+      if (!O0 || !O1 || *O1 < *O0 || ((*O1 - *O0) % X4Width) != 0) {
+        QueueOrderProof = false;
+        break;
+      }
+      unsigned Stage = (*O1 - *O0) / X4Width;
+      if (Stage >= StageCount) {
+        QueueOrderProof = false;
+        break;
+      }
+      ProducerStage[P] = Stage;
+      ++StageCounts[Stage];
+    }
+    for (unsigned S = 0; S != StageCount; ++S)
+      QueueOrderProof &= StageCounts[S] == GroupsPerStage;
+  }
+  if (QueueOrderProof) {
+    for (unsigned S = 0; S != StageCount; ++S) {
+      unsigned PublishedStage = UINT_MAX;
+      for (unsigned I = S * AccessesPerStage; I != (S + 1) * AccessesPerStage;
+           ++I) {
+        unsigned P;
+        LoadInst *Prod =
+            getX4Producer(cast<StoreInst>(Stores[I].I)->getValueOperand(), P);
+        auto It = ProducerStage.find(Prod);
+        if (It == ProducerStage.end() ||
+            (PublishedStage != UINT_MAX && PublishedStage != It->second)) {
+          QueueOrderProof = false;
+          break;
+        }
+        PublishedStage = It->second;
+      }
+      QueueOrderProof &= PublishedStage == S;
+    }
+  }
+
+  unsigned QueueSlots = 0;
+  if (QueueOrderProof) {
+    for (unsigned O = 0; O != Ordered.size(); ++O) {
+      unsigned Live = 0;
+      for (unsigned S = 0; S != StageCount; ++S)
+        Live += StageFirstLoad[S] <= O && O <= StageLastStore[S];
+      QueueSlots = std::max(QueueSlots, Live);
+    }
+  }
+  const bool QueueDepthProof = QueueOrderProof && QueueSlots == 2;
+  if (!QueueOrderProof)
+    Reasons.push_back("queue-order");
+  if (QueueOrderProof && !QueueDepthProof)
+    Reasons.push_back("queue-depth-not-two");
+
+  const bool StoreComplete = StageCount != 0 &&
+                             Stores.size() == StageCount * AccessesPerStage &&
+                             ExtraStores == 0;
+  ConsumerComplete &= StageCount != 0 && ExtraConsumers == 0;
+  bool AliasProof = LDS && !Aliases && !Escapes && !ExtraStores &&
+                    !ExtraConsumers && !UnsupportedFlags && InBounds;
+  bool WaitHazardProof = ProducerSSAWaitProof && BarrierOrderProof &&
+                         FenceProof && OverwriteProof && CFGProof;
+  bool Candidate = Reasons.empty();
+  errs() << "AMDGPU-DIRECT-LDS-CFG-V2 {\"function\":\"" << F.getName()
+         << "\",\"status\":\"" << (Candidate ? "matched" : "rejected")
+         << "\",\"target\":\"" << Target << "\",\"workgroup\":" << Workgroup
+         << ",\"wave_count\":" << WaveCount << ",\"x4_width\":" << X4Width
+         << ",\"producer_count\":" << Producers.size()
+         << ",\"groups_per_stage\":" << GroupsPerStage
+         << ",\"stage_count\":" << StageCount
+         << ",\"queue_slots\":" << QueueSlots
+         << ",\"region_size\":" << RegionSize
+         << ",\"base_displacement\":" << BaseDisplacement
+         << ",\"producer_complete\":" << (ProducerComplete ? "true" : "false")
+         << ",\"store_complete\":" << (StoreComplete ? "true" : "false")
+         << ",\"consumer_complete\":" << (ConsumerComplete ? "true" : "false")
+         << ",\"mapping_words\":" << (MappingProof ? MappingWords : 0)
+         << ",\"mapping_proof\":" << (MappingProof ? "true" : "false")
+         << ",\"region_base_proof\":" << (RegionProof ? "true" : "false")
+         << ",\"alias_proof\":" << (AliasProof ? "true" : "false")
+         << ",\"barrier_order_proof\":"
+         << (BarrierOrderProof ? "true" : "false")
+         << ",\"workgroup_fence_proof\":" << (FenceProof ? "true" : "false")
+         << ",\"producer_ssa_wait_proof\":"
+         << (ProducerSSAWaitProof ? "true" : "false")
+         << ",\"wait_hazard_proof\":" << (WaitHazardProof ? "true" : "false")
+         << ",\"overwrite_proof\":" << (OverwriteProof ? "true" : "false")
+         << ",\"queue_order_proof\":" << (QueueOrderProof ? "true" : "false")
+         << ",\"queue_depth_proof\":" << (QueueDepthProof ? "true" : "false")
+         << ",\"queue_live_intervals\":[";
+  for (unsigned I = 0; I != StageCount; ++I) {
+    if (I)
+      errs() << ',';
+    errs() << '[' << StageFirstLoad[I] << ',' << StageLastStore[I] << ']';
+  }
+  errs() << "]"
+         << ",\"extra_producers\":" << ExtraProducers
+         << ",\"extra_consumers\":" << ExtraConsumers
+         << ",\"extra_stores\":" << ExtraStores
+         << ",\"extra_reads\":" << ExtraReads << ",\"aliases\":" << Aliases
+         << ",\"escapes\":" << Escapes
+         << ",\"unsupported_memory_flags\":" << UnsupportedFlags
+         << ",\"control_flow_gaps\":" << (MalformedCFG ? 1 : 0)
+         << ",\"load_to_publish_ir_distance\":[";
+  for (unsigned I = 0; I != LoadPublish.size(); ++I) {
+    if (I)
+      errs() << ',';
+    errs() << '[' << LoadPublish[I].first << ',' << LoadPublish[I].second
+           << ']';
+  }
+  errs() << "],\"publish_to_consume_ir_distance\":[";
+  for (unsigned I = 0; I != PublishConsume.size(); ++I) {
+    if (I)
+      errs() << ',';
+    errs() << '[' << PublishConsume[I].first << ',' << PublishConsume[I].second
+           << ']';
+  }
+  errs() << "],\"transform_ready\":false,\"transform_reason\":"
+            "\"resource-256-and-atomic-stage-lowering-not-implemented\","
+            "\"reasons\":[";
+  for (unsigned I = 0; I != Reasons.size(); ++I) {
+    if (I)
+      errs() << ',';
+    errs() << '\"' << Reasons[I] << '\"';
+  }
+  errs() << "]}\n";
 }
 
 static bool isAllowedCall(const CallBase &CB) {
@@ -604,6 +1250,11 @@ bool AMDGPUAutoDirectLDSLegacy::runOnFunction(Function &F) {
   ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
   UniformityInfo &UI =
       getAnalysis<UniformityInfoWrapperPass>().getUniformityInfo();
+  if (DirectLDSDiagnostic) {
+    DominatorTree DT(F);
+    PostDominatorTree PDT(F);
+    printCFGV2Report(F, SE, UI, DT, PDT);
+  }
   if (!hasWellFormedWavesPerEUSyntax(F))
     return false;
   return runAutoDirectLDS(
@@ -616,6 +1267,9 @@ PreservedAnalyses AMDGPUAutoDirectLDSPass::run(Function &F,
   LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
   ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
   UniformityInfo &UI = FAM.getResult<UniformityInfoAnalysis>(F);
+  if (DirectLDSDiagnostic)
+    printCFGV2Report(F, SE, UI, FAM.getResult<DominatorTreeAnalysis>(F),
+                     FAM.getResult<PostDominatorTreeAnalysis>(F));
   if (!hasWellFormedWavesPerEUSyntax(F))
     return PreservedAnalyses::all();
   if (!runAutoDirectLDS(
