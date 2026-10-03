@@ -7,7 +7,6 @@ The main topic is a direct load from HBM into LDS.
 This path can avoid a temporary vector register and an LDS write instruction.
 
 This document also lists other instruction encodings that run on MI210 but have incomplete tool support or incomplete public documentation.
-These extra instructions are not implemented by this compiler fork unless this document says otherwise.
 
 ## Terms
 
@@ -28,8 +27,6 @@ These extra instructions are not implemented by this compiler fork unless this d
 - **Documented** means the AMD MI200 manual describes the operation.
 - **Decode-confirmed** means the assembler or disassembler recognizes the encoding.
 - **Executed-confirmed** means a test ran on MI210 and checked the result.
-- **Compiler-implemented** means this compiler fork can generate or process the operation.
-- **Not implemented** means this compiler fork has no automatic source transformation for the operation.
 - **Rejected** means the gfx90a assembler rejects the source form.
 - **Faults** means the raw encoding caused a GPU instruction fault in the test.
 
@@ -78,21 +75,18 @@ Only the low 16 bits of `m0` select the LDS byte base.
 Software must set `m0` before the load.
 A missing `m0` setup can cause the write to disappear without a clear error.
 
-## 1.2 Supported widths in this compiler fork
+## 1.2 Executed widths and encodings
 
-Upstream LLVM permits only the narrow gfx90a forms.
-Upstream LLVM reserves the wide x2, x3, and x4 forms for newer targets.
-
-This compiler fork enables the following gfx90a forms:
+The following forms execute on gfx90a:
 
 | Form | Bytes per lane | First encoding word | Status |
 |---|---:|---:|---|
-| `global_load_dword ... lds` | 4 | `0xDC50A000` | Executed-confirmed; upstream support exists |
-| `global_load_dwordx2 ... lds` | 8 | `0xDC54A000` | Executed-confirmed; compiler-implemented here |
-| `global_load_dwordx3 ... lds` | 12 | `0xDC58A000` | Executed-confirmed; compiler-implemented here |
-| `global_load_dwordx4 ... lds` | 16 | `0xDC5CA000` | Executed-confirmed; compiler-implemented here |
+| `global_load_dword ... lds` | 4 | `0xDC50A000` | Executed-confirmed |
+| `global_load_dwordx2 ... lds` | 8 | `0xDC54A000` | Executed-confirmed |
+| `global_load_dwordx3 ... lds` | 12 | `0xDC58A000` | Executed-confirmed |
+| `global_load_dwordx4 ... lds` | 16 | `0xDC5CA000` | Executed-confirmed |
 
-Compiler-generated x2, x3, and x4 kernels passed MI210 result checks.
+The x2, x3, and x4 execution tests passed MI210 result checks.
 
 The width field is in bits 19 and 18 of the first instruction word.
 The four values use the sequence `0x50`, `0x54`, `0x58`, and `0x5C` in that part of the word.
@@ -131,11 +125,7 @@ The x4 footprint is 256 dwords, or 1,024 bytes, per wave.
 The x3 form uses the x4 footprint but leaves 64 dword holes.
 
 A consumer must use the inverse placement.
-A normal linear LDS read is not automatically correct for x2, x3, or x4 data.
-
-This compiler fork contains one shared placement model.
-The legality checks and consumer checks use that model.
-They do not use separate copied formulas.
+A normal linear LDS read is not correct for x2, x3, or x4 data unless it applies this placement.
 
 ## 1.4 Narrow loads
 
@@ -206,14 +196,9 @@ Two reads into the same destination did not work.
 A dead scratch read did not work.
 A read from another address before the affected read did not work.
 
-This compiler fork models the hazard with LDS alias information.
-It keeps useful DS pipelines when they already provide the required ordering.
-It uses the isolated repair only for supported cases.
-It reports an error when it cannot allocate a safe function-wide scratch VGPR.
-
-Text assembly does not contain enough alias information for every runtime LDS address.
-Text assembly therefore needs explicit direct-LDS read annotations.
-A raw `.long` instruction is opaque to the semantic hazard pass.
+Assembly source does not always show whether two runtime LDS addresses can refer to the same bytes.
+Manual scheduling must treat unknown LDS aliases as possible aliases.
+A raw `.long` instruction also hides the direct-load meaning from normal assembly analysis.
 
 The isolated repair is not yet proved for every DS read form.
 Do not assume that the b32 repair also proves b64, b128, `ds_read2_b32`, or `ds_read2st64_b32` behavior.
@@ -248,30 +233,9 @@ Old VI-era bytes do not decode as these instructions on gfx90a.
 
 Use the `global_load_* ... lds` FLAT path described above.
 
-## 1.9 Current compiler limits
-
-This fork implements wide instruction parsing, verification, selection, scheduling, wait tracking, and hazard handling.
-It also provides an explicit-base source contract for compiler tests and controlled use.
-
-The automatic ordinary-source fusion is conservative.
-It currently supports only a fully proved gfx90a wave64 x4 layout.
-It requires complete producer and consumer matching.
-It rejects partial coverage, duplicate consumers, missing consumers, unknown aliases, dynamic LDS addresses, invalid stride, and unsupported resource facts.
-
-The compiler has a diagnostic matcher for a larger CK `cfg_v2` queue.
-That matcher proves four waves, six producer groups per stage, four stages, two live queue slots, and 6,144 mapped LDS words.
-It does not generate code for that large queue.
-The report keeps `transform_ready` false.
-
-The real CK queue still needs one atomic all-producer rewrite.
-It must rewrite every producer and every affected consumer together.
-A producer-only change is unsafe.
-
 # 2. Other executed undocumented instructions
 
-The instructions in this section are not part of the direct-load compiler work.
-Most have no useful compiler implementation in this fork.
-Some only copy, clear, or preserve registers.
+Some instructions in this section only copy, clear, or preserve registers.
 They are still listed because raw opcode experiments can otherwise produce misleading results.
 
 ## 2.1 Unassigned VOP3P opcode IDs
@@ -311,7 +275,6 @@ AGPR behavior differs:
 
 These are measured aliases.
 They do not have approved MI210 instruction names.
-This fork does not expose them as compiler operations.
 
 ## 2.2 Unassigned VOP3 opcode IDs
 
@@ -347,7 +310,6 @@ Filling ordinary LDS did not activate the parameter store.
 
 Modifier, wait, repetition, and ordered-pair tests did not enable another operation.
 The surviving IDs do not provide a useful new compute path.
-This fork does not expose them as compiler operations.
 
 ## 2.3 Unassigned VOP1 opcode IDs
 
@@ -388,8 +350,6 @@ Reserved selectors produced fixed or state-derived values in some cases.
 Their meanings are not assigned.
 Do not use those selector forms in production code.
 
-This fork does not expose these VOP1 IDs as compiler operations.
-
 ## 2.4 VOP2 has no free opcode ID
 
 VOP2 is a two-source vector instruction format.
@@ -403,7 +363,7 @@ Selector `0x0FE`, named `src_lds_direct` by LLVM, did not expose initialized LDS
 SDWA selector `0x0F9` and DPP selector `0x0FA` are extension prefixes.
 They are not free source values.
 
-There is no unassigned VOP2 opcode to implement.
+There is no unassigned VOP2 opcode.
 
 ## 2.5 Unassigned SOP2 opcode IDs
 
@@ -415,7 +375,7 @@ The 11 holes are `0x35` through `0x3F`.
 Every hole faulted in an execution test.
 A known-good scalar operation passed after each fault.
 
-There is no surviving SOP2 operation to implement.
+There is no surviving SOP2 operation.
 
 ## 2.6 Unassigned SOP1 opcode IDs
 
@@ -435,7 +395,6 @@ The remaining holes were not raw-executed when adjacent architectures assigned u
 
 Do not assign an official mnemonic to `0x2F` or `0x31` from this evidence.
 ID `0x31` gives no known benefit over `s_mov_b32`.
-This fork does not expose either ID.
 
 # 3. Under-documented AGPR paths
 
@@ -473,8 +432,6 @@ Wider AGPR tuples still need normal register alignment.
 The `.amdhsa_accum_offset` field uses units of four VGPRs.
 For example, code that reserves 64 VGPRs must use an accumulator offset of 16.
 
-This compiler fork does not add a new automatic transformation for these AGPR forms.
-
 ## 3.2 `ds_append` and `ds_consume` with AGPR destinations
 
 `ds_append a5` and `ds_consume a5` execute on MI210.
@@ -485,7 +442,6 @@ Software needs a lane-prefix operation such as `mbcnt` when each lane needs a un
 
 These instructions can support a wave-level reservation counter.
 They do not replace a complete producer and consumer queue protocol.
-This fork does not use them for the direct-LDS queue.
 
 ## 3.3 Direct SGPR-to-AGPR write
 
@@ -500,8 +456,6 @@ It can avoid an SGPR-to-VGPR-to-AGPR sequence.
 
 Tests checked direct writes and a following matrix instruction.
 This path is useful for accumulator initialization and shared constants.
-LLVM already has target support for this operation.
-This fork adds no new optimization for it.
 
 The reverse AGPR-to-VGPR path uses `v_accvgpr_read_b32`.
 Do not treat it as a cheap spill path.
@@ -521,7 +475,7 @@ s_barrier_wait
 These split-barrier forms exist on gfx908.
 MI210 software must use the full `s_barrier` for normal workgroup synchronization.
 
-A compiler cannot safely schedule gfx908 split barriers on gfx90a.
+Do not use gfx908 split barriers in gfx90a code.
 Reduce barrier count by changing the tile or queue design instead.
 
 ## 4.2 GWS operations remain unproved here
@@ -541,7 +495,6 @@ Do not use them as a production cross-workgroup synchronization path without a s
 
 The gfx90a assembler rejects `ds_ordered_count`.
 No raw execution result proves that it is safe on MI210.
-This fork does not use it.
 
 ## 4.4 `lds_direct` is not direct global-to-LDS
 
@@ -582,7 +535,6 @@ Use several source patterns and EXEC masks.
 
 The most useful undocumented MI210 path is the wide FLAT direct HBM-to-LDS load.
 The x2, x3, and x4 forms execute correctly on MI210.
-This compiler fork implements their basic compiler and assembler support.
 
 The path has strict limits:
 
@@ -592,9 +544,7 @@ The path has strict limits:
 - Cross-wave consumers need a barrier after the VMEM wait.
 - Same-address overwrite while the load is active is unsafe.
 - The first DS read has a special result hazard.
-- Automatic source fusion needs complete producer, consumer, alias, resource, and queue proofs.
-- The large CK queue is diagnostic-only today.
 
 Most other unassigned opcode survivors only copy, clear, preserve, or fault.
 They do not provide hidden sparse matrix hardware on MI210.
-The AGPR DS paths and direct SGPR-to-AGPR write are useful, but this fork does not yet optimize ordinary source to use them.
+The AGPR DS paths and direct SGPR-to-AGPR write are also useful instruction paths.
